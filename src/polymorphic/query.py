@@ -4,11 +4,12 @@ QuerySet for PolymorphicModel
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import heapq
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any, Generic, cast, overload
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator as _AsyncIterator, Generic, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
@@ -137,6 +138,59 @@ def transmogrify(cls: type[_All], obj: models.Model) -> _All:
         for k, v in obj.__dict__.items():
             new.__dict__[k] = v  # pyright: ignore[reportIndexIssue]
         return new
+
+
+class PolymorphicAsyncModelIterable(ModelIterable, Generic[_All, _Base]):
+    """
+    Async ModelIterable for PolymorphicModel.
+
+    Yields real instances asynchronously if qs.polymorphic_disabled is False,
+    otherwise acts like a regular ModelIterable in async context.
+    """
+
+    queryset: "PolymorphicQuerySet[_All, _Base]"
+
+    async def __aiter__(self) -> _AsyncIterator[_All]:
+        if self.queryset.polymorphic_disabled:
+            async for item in super().__aiter__():
+                yield item
+            return
+        async for item in self._polymorphic_async_iterator():
+            yield item
+
+    async def _polymorphic_async_iterator(self) -> _AsyncIterator[_All]:
+        """
+        Async version of _polymorphic_iterator.
+
+        Fetches objects in chunks from the database, performs polymorphic downcast
+        asynchronously per chunk using _aget_real_instances, and yields real instances.
+        """
+        max_chunk = connections[self.queryset.db].features.max_query_params
+        sql_chunk = self.chunk_size if self.chunked_fetch else None
+        if max_chunk:
+            sql_chunk = (
+                max_chunk
+                if not self.chunked_fetch
+                else min(max_chunk, self.chunk_size or max_chunk)
+            )
+        sql_chunk = sql_chunk or Polymorphic_QuerySet_objects_per_request
+
+        # Use Django's async iterator from the non-polymorphic base queryset
+        async_iter = QuerySet.aiterator(self.queryset.non_polymorphic(), chunk_size=sql_chunk)
+        buffer: list[_All] = []
+
+        async for item in async_iter:
+            buffer.append(item)
+            if len(buffer) >= sql_chunk:
+                real_instances = await self.queryset._aget_real_instances(buffer)
+                for real_instance in real_instances:
+                    yield real_instance
+                buffer = []
+
+        if buffer:
+            real_instances = await self.queryset._aget_real_instances(buffer)
+            for real_instance in real_instances:
+                yield real_instance
 
 
 ###################################################################################
@@ -699,3 +753,391 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         disrupts the model hierarchy/relationship traversal.
         """
         return QuerySet.delete(self.non_polymorphic())
+
+    # ---------------------------------------------------------------------------
+    # Async ORM support
+    # ---------------------------------------------------------------------------
+
+    async def _aget_real_instances(self, base_result_objects: Sequence[_All]) -> list[_All]:
+        """
+        Async version of _get_real_instances.
+
+        Performs polymorphic downcast of base model instances to their real
+        subclasses using async ORM queries. Mirrors the logic of the synchronous
+        _get_real_instances but uses async queries (async for / await) to fetch
+        subclass instances.
+        """
+        resultlist: list[Any] = []
+
+        # dict contains one entry per unique model type occurring in result,
+        # in the format idlist_per_model[modelclass]=[list-of-object-ids]
+        idlist_per_model: defaultdict[Any, list[Any]] = defaultdict(list)
+        indexlist_per_model: defaultdict[Any, list[tuple[int, int]]] = defaultdict(list)
+
+        # priority queue holding the query order of concrete classes
+        # we need this so we can retry fetching objects further up the hierarchy with
+        # stale content types - this can happen in some legitimate cases (deletion)
+        # we build up and pop classes off this queue to ensure we process in tree
+        # traversal order (leaves first) - this allows us to retry fetching as parent
+        # classes if child class retrieval fails
+        classes_to_query: list[tuple[int, Any]] = []
+
+        # use the pk attribute for the base model type used in the query to identify
+        # objects
+        pk_name = self.model._meta.pk.attname
+
+        # - sort base_result_object ids into idlist_per_model lists, depending on their real class;
+        # - store objects that already have the correct class into "results"
+        content_type_manager = ContentType.objects.db_manager(self.db)
+        self_model_class_id = content_type_manager.get_for_model(
+            self.model, for_concrete_model=False
+        ).pk
+        self_concrete_model_class_id = content_type_manager.get_for_model(
+            self.model, for_concrete_model=True
+        ).pk
+
+        class_priorities = {
+            mdl: idx + 1
+            for idx, mdl in enumerate((*reversed(concrete_descendants(self.model)), self.model))
+        }
+
+        for i, base_object in enumerate(base_result_objects):
+            if base_object.polymorphic_ctype_id == self_model_class_id:
+                # Real class is exactly the same as base class, go straight to results
+                resultlist.append(base_object)
+            else:
+                real_concrete_class = base_object.get_real_instance_class()
+                real_concrete_class_id = base_object.get_real_concrete_instance_class_id()
+
+                if real_concrete_class_id is None:
+                    # Dealing with a stale content type
+                    continue
+                elif real_concrete_class_id == self_concrete_model_class_id:
+                    # Real and base classes share the same concrete ancestor,
+                    # upcast it and put it in the results
+                    # real_concrete_class is guaranteed to be a PolymorphicModel subclass
+                    resultlist.append(
+                        transmogrify(
+                            cast("type[PolymorphicModel]", real_concrete_class), base_object
+                        )
+                    )
+                else:
+                    # This model has a concrete derived class, track it for bulk retrieval.
+                    real_concrete_class = cast(
+                        "type[_All] | None",
+                        content_type_manager.get_for_id(real_concrete_class_id).model_class(),
+                    )
+                    if real_concrete_class is not None:
+                        if real_concrete_class not in idlist_per_model:
+                            # Maintain a priority queue to process the model classes
+                            # in order of their occurrence in the inheritance tree - leafs
+                            # first
+                            heapq.heappush(
+                                classes_to_query,
+                                (
+                                    class_priorities.get(real_concrete_class, 0),
+                                    real_concrete_class,
+                                ),
+                            )
+                        idlist_per_model[real_concrete_class].append(getattr(base_object, pk_name))
+                        indexlist_per_model[real_concrete_class].append((i, len(resultlist)))
+                    resultlist.append(None)
+
+        # For each model in "idlist_per_model" request its objects (the real model)
+        # from the db asynchronously and store them in results[].
+        # Then we copy the annotate fields from the base objects to the real objects.
+        # Then we copy the extra() select fields from the base objects to the real objects.
+
+        while classes_to_query:
+            _, real_concrete_class = heapq.heappop(classes_to_query)
+            if real_concrete_class not in idlist_per_model:
+                continue
+            idlist = idlist_per_model.pop(real_concrete_class)
+            indices = indexlist_per_model.pop(real_concrete_class)
+
+            # Build the queryset for this subclass
+            subclass_qs = real_concrete_class._base_objects.db_manager(self.db).filter(
+                **{f"{pk_name}__in": idlist}
+            )
+            # copy select related configuration to new qs
+            subclass_qs.query.select_related = self.query.select_related
+
+            # Copy prefetch related configuration to new queryset
+            if self._prefetch_related_lookups:
+                subclass_qs._prefetch_related_lookups = list(self._prefetch_related_lookups)
+                if hasattr(self, "_prefetch_done"):
+                    subclass_qs._prefetch_done = self._prefetch_done
+
+            # Copy deferred fields configuration to the new queryset
+            deferred_loading_fields = []
+            existing_fields = self.polymorphic_deferred_loading[0]
+            for field in existing_fields:
+                try:
+                    translated_field_name = translate_polymorphic_field_path(
+                        real_concrete_class, field
+                    )
+                except AssertionError:
+                    if "___" in field:
+                        # The originally passed argument to .defer() or .only()
+                        # was in the form Model2B___field2, where Model2B is
+                        # now a superclass of real_concrete_class. Thus it's
+                        # sufficient to just use the field name.
+                        translated_field_name = field.rpartition("___")[-1]
+
+                        # Check if the field does exist.
+                        # Ignore deferred fields that don't exist in this subclass type.
+                        try:
+                            real_concrete_class._meta.get_field(translated_field_name)
+                        except FieldDoesNotExist:
+                            continue
+                    else:
+                        raise
+                deferred_loading_fields.append(translated_field_name)
+            subclass_qs.query.deferred_loading = (
+                set(deferred_loading_fields),
+                self.query.deferred_loading[1],
+            )
+
+            # Async iteration to fetch real objects
+            real_objects_list: list[_All] = [obj async for obj in subclass_qs]
+            real_objects_dict = {
+                getattr(real_object, pk_name): real_object for real_object in real_objects_list
+            }
+
+            for base_idx, result_idx in indices:
+                base_object = base_result_objects[base_idx]
+                o_pk = getattr(base_object, pk_name)
+                real_object = real_objects_dict.get(o_pk)
+                if real_object is None:
+                    # Our content type is pointing to a row that does not exist anymore
+                    # We try to find the next best available parent row
+                    inheritance_path = route_to_ancestor(real_concrete_class, self.model)
+                    if not inheritance_path or inheritance_path[0].model is self.model:
+                        resultlist[result_idx] = base_object
+                    else:
+                        next_best_class = inheritance_path[0].model
+                        if next_best_class not in idlist_per_model:
+                            # add this class to the priority try queue
+                            heapq.heappush(
+                                classes_to_query,
+                                (
+                                    class_priorities.get(next_best_class, 0),
+                                    next_best_class,
+                                ),
+                            )
+                        idlist_per_model[next_best_class].append(o_pk)
+                        indexlist_per_model[next_best_class].append((base_idx, result_idx))
+                        resultlist[result_idx] = _Inconsistent
+                    continue
+
+                # need shallow copy to avoid duplication in caches (see PR #353)
+                real_object = copy.copy(real_object)
+                real_class = (
+                    real_concrete_class
+                    if resultlist[result_idx] is _Inconsistent
+                    else real_object.get_real_instance_class()
+                )
+
+                # If the real class is a proxy, upcast it
+                if real_class != real_concrete_class:
+                    real_object = transmogrify(
+                        cast("type[PolymorphicModel]", real_class), real_object
+                    )
+
+                if self.query.annotations:
+                    # New in Django 3.2+: annotation_select contains only the selected annotations
+                    # (excluding aliases). Fallback for older Django versions if needed.
+                    annotation_select = getattr(
+                        self.query, "annotation_select", self.query.annotations
+                    )
+                    for anno_field_name in annotation_select.keys():
+                        if hasattr(base_object, anno_field_name):
+                            attr = getattr(base_object, anno_field_name)
+                            setattr(real_object, anno_field_name, attr)
+
+                if self.query.extra_select:
+                    for select_field_name in self.query.extra_select.keys():
+                        attr = getattr(base_object, select_field_name)
+                        setattr(real_object, select_field_name, attr)
+
+                resultlist[result_idx] = real_object
+
+        # Filter out inconsistent / None entries
+        resultlist = [i for i in resultlist if i and i is not _Inconsistent]
+
+        # set polymorphic_annotate_names in all objects (currently just used for debugging/printing)
+        if self.query.annotations:
+            # get annotate field list
+            annotation_select = getattr(self.query, "annotation_select", self.query.annotations)
+            annotate_names = list(annotation_select.keys())
+            for real_object in resultlist:
+                real_object.polymorphic_annotate_names = annotate_names
+
+        # set polymorphic_extra_select_names in all objects (currently just used for debugging/printing)
+        if self.query.extra_select:
+            # get extra select field list
+            extra_select_names = list(self.query.extra_select.keys())
+            for real_object in resultlist:
+                real_object.polymorphic_extra_select_names = extra_select_names
+
+        return resultlist
+
+    async def aget_real_instances(
+        self, base_result_objects: Iterable[_All] | None = None
+    ) -> list[_All]:
+        """
+        Async version of get_real_instances.
+
+        Cast a list of objects to their actual classes asynchronously.
+        """
+        if base_result_objects is None:
+            # Use non-polymorphic async fetch to get base objects
+            base_result_list = [obj async for obj in self.non_polymorphic()]
+        elif isinstance(base_result_objects, list):
+            base_result_list = base_result_objects
+        else:
+            base_result_list = list(base_result_objects)
+        olist = await self._aget_real_instances(base_result_list)
+        if not self.model.polymorphic_query_multiline_output:
+            return olist
+        return PolymorphicQuerySet._p_list_class(olist)
+
+    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+        """
+        Async version of get().
+
+        Fetches the object matching the given arguments and performs
+        polymorphic downcast to return the real instance.
+        """
+        # Apply filter translation (for instance_of etc.)
+        if args or kwargs:
+            clone = self.filter(*args, **kwargs)
+        else:
+            clone = self
+
+        if not clone.polymorphic_disabled:
+            # Use QuerySet.acount() for efficient counting (avoids loading all objects)
+            num = await QuerySet.acount(clone.non_polymorphic())
+            if num == 1:
+                return (await clone.afirst())
+            if not num:
+                raise self.model.DoesNotExist(
+                    f"{self.model._meta.object_name} matching query does not exist."
+                )
+            raise self.model.MultipleObjectsReturned(
+                f"get() returned more than one {self.model._meta.object_name} -- it returned {num}!"
+            )
+        return await QuerySet.aget(clone)
+
+    async def afirst(self) -> _All | None:
+        """
+        Async version of first().
+
+        Returns the first object of the queryset with polymorphic downcast applied.
+        """
+        # Use the non-polymorphic query to get base instance, then downcast
+        clone = self[:1]
+        base_results = [obj async for obj in QuerySet.aiterator(clone.non_polymorphic())]
+        if not base_results:
+            return None
+        real_instances = await clone._aget_real_instances(base_results)
+        if not real_instances:
+            return None
+        return real_instances[0]
+
+    async def alast(self) -> _All | None:
+        """
+        Async version of last().
+
+        Returns the last object of the queryset with polymorphic downcast applied.
+        """
+        # Reverse the ordering to get last via first
+        reversed_qs = cast(Self, self.reverse())
+        return await reversed_qs.afirst()
+
+    async def aiterator(
+        self, chunk_size: int = 2000
+    ) -> AsyncIterator[_All]:
+        """
+        Async version of iterator().
+
+        Returns an async generator that yields real polymorphic instances
+        with chunked fetch and concurrent subclass query resolution.
+        """
+        if self.polymorphic_disabled:
+            async for item in QuerySet.aiterator(self, chunk_size=chunk_size):
+                yield item
+            return
+
+        # Polymorphic path: chunked fetch with async downcast
+        max_chunk = connections[self.db].features.max_query_params
+        sql_chunk = chunk_size if chunk_size else None
+        if max_chunk:
+            sql_chunk = (
+                max_chunk
+                if not chunk_size
+                else min(max_chunk, chunk_size or max_chunk)
+            )
+        sql_chunk = sql_chunk or Polymorphic_QuerySet_objects_per_request
+
+        # Build a non-polymorphic clone to iterate base objects
+        base_iter = QuerySet.aiterator(self.non_polymorphic(), chunk_size=sql_chunk)
+        buffer: list[_All] = []
+
+        async for item in base_iter:
+            buffer.append(item)
+            if len(buffer) >= sql_chunk:
+                real_instances = await self._aget_real_instances(buffer)
+                for real_instance in real_instances:
+                    yield real_instance
+                buffer = []
+
+        if buffer:
+            real_instances = await self._aget_real_instances(buffer)
+            for real_instance in real_instances:
+                yield real_instance
+
+    async def acount(self) -> int:
+        """
+        Async version of count().
+
+        Performs an async count() on the non-polymorphic base queryset.
+        """
+        # Count doesn't need polymorphic behavior
+        return await QuerySet.acount(self)
+
+    async def aexists(self) -> bool:
+        """
+        Async version of exists().
+
+        Performs an async exists() on the non-polymorphic base queryset.
+        """
+        return await QuerySet.aexists(self)
+
+    async def aupdate(self, **kwargs: Any) -> int:
+        """
+        Async version of update().
+
+        Performs an async update() on the non-polymorphic base queryset
+        to avoid disrupting Django's model hierarchy/relationship traversal.
+        """
+        return await QuerySet.aupdate(self.non_polymorphic(), **kwargs)
+
+    async def _aget_results(self) -> list[_All]:
+        """
+        Internal helper: async version of fetching all results with downcast.
+        Used by __aiter__.
+        """
+        if self.polymorphic_disabled:
+            return [obj async for obj in QuerySet.aiterator(self)]
+        base_results = [obj async for obj in QuerySet.aiterator(self.non_polymorphic())]
+        return await self._aget_real_instances(base_results)
+
+    def __aiter__(self) -> AsyncIterator[_All]:
+        """
+        Async iterator support for PolymorphicQuerySet.
+
+        Returns an async generator yielding polymorphic downcasted instances.
+        """
+        # Delegate to aiterator() method to reuse its logic
+        return self.aiterator()
