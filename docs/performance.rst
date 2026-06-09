@@ -49,6 +49,13 @@ objects at once:
     for obj in ModelA.objects.all().iterator(chunk_size=5000):
         process(obj)
 
+The async iterator follows the same chunking rules:
+
+.. code-block:: python
+
+    async for obj in ModelA.objects.all().aiterator(chunk_size=5000):
+        await process(obj)
+
 .. note::
 
     ``chunk_size`` on non-polymorphic QuerySets controls the number of rows fetched from the
@@ -75,6 +82,13 @@ this somewhere that will be executed during startup:
 
     query.Polymorphic_QuerySet_objects_per_request = 5000
 
+Async Benchmarks
+----------------
+
+The test suite includes async performance baselines that verify polymorphic async iteration keeps
+the same query-count envelope as the synchronous implementation for mixed subclass result sets.
+Those benchmarks run in the existing SQLite, PostgreSQL, and MySQL matrix, so backend-specific
+parameter limits and eager-loading behavior are exercised continuously.
 
 :class:`~django.contrib.contenttypes.models.ContentType` retrieval
 ------------------------------------------------------------------

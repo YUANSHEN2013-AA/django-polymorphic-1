@@ -79,3 +79,37 @@ When the model is created elsewhere, you can also use the
     reset_polymorphic_ctype(Base, Sub1, Sub2)
 
     reset_polymorphic_ctype(Base, Sub1, Sub2, ignore_existing=True)
+
+Upgrading to Async QuerySets
+---------------------------
+
+No public API changes are required to start using the async queryset methods.
+Existing polymorphic managers and querysets continue to work with the same
+``instance_of()`` and ``not_instance_of()`` filters, queryset cloning, related
+loading, and multi-database routing behavior.
+
+When moving existing code to async views or tasks:
+
+#. Replace blocking queryset evaluation with the async variants such as
+   ``aget()``, ``afirst()``, ``alast()``, ``aiterator()``, ``acount()``,
+   ``aexists()``, and ``aupdate()``.
+#. Replace synchronous iteration with ``async for`` where the queryset itself is
+   consumed.
+#. Keep the same eager-loading calls. ``select_related()`` and
+   ``prefetch_related()`` preserve polymorphic downcasting when used with async
+   queryset evaluation.
+#. Keep the same database selection calls. ``using()`` and ``db_manager()``
+   continue to route base-model, subclass, and content-type queries to the same
+   database alias.
+
+Example migration:
+
+.. code-block:: python
+
+    project = await Project.objects.instance_of(ArtProject).aget(pk=project_id)
+
+    async for project in Project.objects.not_instance_of(ArchivedProject).order_by("pk"):
+        ...
+
+The async implementation is covered by the existing SQLite, PostgreSQL, and
+MySQL test matrix for Django 4.2, 5.2, and 6.0.

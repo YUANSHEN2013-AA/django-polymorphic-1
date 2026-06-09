@@ -93,6 +93,7 @@ Features
   - Filtering/ordering of inherited models (``ArtProject___artist``).
   - Filtering model types: :meth:`~polymorphic.managers.PolymorphicQuerySet.instance_of` and
     :meth:`~polymorphic.managers.PolymorphicQuerySet.not_instance_of`
+  - Async queryset support with polymorphic downcasting.
   - Combining querysets of different models (``qs3 = qs1 | qs2``)
   - Support for custom user-defined managers.
 
@@ -109,6 +110,7 @@ Getting started
 
    quickstart
    admin
+   async
    performance
    integrations/index
 
