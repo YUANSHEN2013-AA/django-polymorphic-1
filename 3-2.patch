@@ -1,0 +1,401 @@
+diff --git a/src/polymorphic/admin/parentadmin.py b/src/polymorphic/admin/parentadmin.py
+index ebb725b..12e5995 100644
+--- a/src/polymorphic/admin/parentadmin.py
++++ b/src/polymorphic/admin/parentadmin.py
+@@ -238,7 +238,42 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         # At this point. all admin code needs to be known.
+         self._lazy_setup()
+ 
+-        return urls
++        from django.urls import path
++        info = self.model._meta.app_label, self.model._meta.model_name
++        my_urls = [
++            path('async-type-choices/', self.admin_site.admin_view(self.async_type_choices_view), name='%s_%s_async_choices' % info),
++        ]
++
++        return my_urls + urls
++
++    def async_type_choices_view(self, request):
++        from django.http import JsonResponse
++        self._lazy_setup()
++        choices = []
++        content_types = ContentType.objects.get_for_models(
++            *self.get_child_models(), for_concrete_models=False
++        )
++
++        for model, ct in content_types.items():
++            perm_function_name = "has_add_permission"
++            model_admin = self._get_real_admin_by_model(model)
++            perm_function = getattr(model_admin, perm_function_name)
++            if not perm_function(request):
++                continue
++            
++            category = getattr(model, "polymorphic_category", None)
++            if not category:
++                # Fallback to app_config verbose_name or app_label
++                from django.apps import apps
++                app_config = apps.get_app_config(model._meta.app_label)
++                category = app_config.verbose_name
++            
++            choices.append({
++                "id": ct.id,
++                "name": str(model._meta.verbose_name),
++                "category": str(category),
++            })
++        return JsonResponse({"choices": choices})
+ 
+     def add_type_view(self, request, form_url=""):
+         """
+@@ -254,21 +289,26 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             # TODO: should this use a Django method instead of manipulating the string directly?
+             extra_qs = f"&{force_str(request.META['QUERY_STRING'])}"
+ 
+-        choices = self.get_child_type_choices(request, "add")
+-        if len(choices) == 0:
+-            raise PermissionDenied
+-        if len(choices) == 1:
+-            return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
+-
+-        # Create form
+-        form = self.add_type_form(
+-            data=request.POST if request.method == "POST" else None,
+-            initial={"ct_id": choices[0][0]},
+-        )
+-        setattr(form.fields["ct_id"], "choices", choices)
++        if request.method == "POST":
++            choices = self.get_child_type_choices(request, "add")
++            if len(choices) == 0:
++                raise PermissionDenied
++            if len(choices) == 1:
++                return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
++            
++            form = self.add_type_form(
++                data=request.POST,
++                initial={"ct_id": choices[0][0]},
++            )
++            setattr(form.fields["ct_id"], "choices", choices)
+ 
+-        if form.is_valid():
+-            return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
++            if form.is_valid():
++                return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
++        else:
++            # For GET requests, we skip loading choices synchronously to support async loading in the UI.
++            # We still need a dummy form for the admin context.
++            form = self.add_type_form(initial={})
++            setattr(form.fields["ct_id"], "choices", [])
+ 
+         # Wrap in all admin layout
+         fieldsets = ((None, {"fields": ("ct_id",)}),)
+@@ -284,6 +324,13 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
+             "app_label": opts.app_label,
+         }
++        
++        # Add the async choices URL to the context
++        from django.urls import reverse
++        info = self.model._meta.app_label, self.model._meta.model_name
++        async_choices_url = reverse(f"{self.admin_site.name}:{info[0]}_{info[1]}_async_choices")
++        context["async_choices_url"] = async_choices_url
++        
+         return self.render_add_type_form(request, context, form_url)
+ 
+     def render_add_type_form(self, request, context, form_url=""):
+diff --git a/src/polymorphic/templates/admin/polymorphic/add_type_form.html b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+index 20cc8ab..aa6cd31 100644
+--- a/src/polymorphic/templates/admin/polymorphic/add_type_form.html
++++ b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+@@ -1,11 +1,285 @@
+-{% extends "admin/change_form.html" %}
++{% extends "admin/base_site.html" %}
++{% load i18n admin_urls static %}
+ 
+-{% if save_on_top %}
+-  {% block submit_buttons_top %}
+-    {% include 'admin/submit_line.html' with show_save=1 %}
+-  {% endblock %}
+-{% endif %}
++{% block extrahead %}
++{{ block.super }}
++<style>
++  #polymorphic-type-selector {
++    max-width: 800px;
++    margin: 20px auto;
++    font-family: sans-serif;
++  }
++  .search-bar {
++    margin-bottom: 20px;
++  }
++  .search-bar input {
++    width: 100%;
++    padding: 10px;
++    font-size: 16px;
++    border: 1px solid #ccc;
++    border-radius: 4px;
++    box-sizing: border-box;
++  }
++  .category-section {
++    margin-bottom: 20px;
++    background: #fff;
++    border: 1px solid #ddd;
++    border-radius: 4px;
++    overflow: hidden;
++  }
++  .category-section h2 {
++    margin: 0;
++    padding: 10px 15px;
++    background: #f8f8f8;
++    border-bottom: 1px solid #ddd;
++    font-size: 16px;
++    color: #333;
++  }
++  .type-list {
++    list-style: none;
++    margin: 0;
++    padding: 0;
++  }
++  .type-item {
++    display: flex;
++    justify-content: space-between;
++    align-items: center;
++    padding: 10px 15px;
++    border-bottom: 1px solid #eee;
++    transition: background-color 0.2s;
++  }
++  .type-item:last-child {
++    border-bottom: none;
++  }
++  .type-item:hover {
++    background-color: #f1f1f1;
++  }
++  .type-link {
++    text-decoration: none;
++    color: #447e9b;
++    font-weight: bold;
++    flex-grow: 1;
++    display: block;
++  }
++  .type-link:hover {
++    color: #036;
++  }
++  .fav-btn {
++    background: none;
++    border: none;
++    cursor: pointer;
++    font-size: 20px;
++    color: #ccc;
++    outline: none;
++  }
++  .fav-btn.active {
++    color: #ffb400;
++  }
++  #loading-spinner {
++    text-align: center;
++    padding: 20px;
++    font-size: 16px;
++    color: #666;
++  }
++  .hidden {
++    display: none !important;
++  }
++</style>
++{% endblock %}
++
++{% block breadcrumbs %}
++<div class="breadcrumbs">
++<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
++&rsaquo; <a href="{% url 'admin:app_list' app_label=app_label %}">{{ app_label|capfirst|escape }}</a>
++&rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
++&rsaquo; {% translate 'Add' %} {{ opts.verbose_name }}
++</div>
++{% endblock %}
++
++{% block content %}
++<div id="content-main">
++  <h1>{% translate 'Select type to add' %}</h1>
++  
++  <div id="polymorphic-type-selector">
++    <div class="search-bar">
++      <input type="text" id="type-search" placeholder="Search subclasses..." autocomplete="off" />
++    </div>
++    
++    <div id="loading-spinner">Loading types...</div>
++    
++    <div id="type-lists" class="hidden">
++      <div id="recent-container" class="category-section hidden">
++        <h2>Recently Used</h2>
++        <ul class="type-list" id="recent-list"></ul>
++      </div>
++      
++      <div id="favorites-container" class="category-section hidden">
++        <h2>Favorites</h2>
++        <ul class="type-list" id="favorites-list"></ul>
++      </div>
++      
++      <div id="categories-container">
++        <!-- Categories will be injected here -->
++      </div>
++    </div>
++  </div>
++</div>
+ 
+-{% block submit_buttons_bottom %}
+-  {% include 'admin/submit_line.html' with show_save=1 %}
++<script>
++document.addEventListener('DOMContentLoaded', function() {
++    const asyncUrl = "{{ async_choices_url|escapejs }}";
++    const extraQs = "{{ request.META.QUERY_STRING|escapejs }}";
++    const storageKeyPrefix = "polymorphic_" + "{{ opts.app_label }}_{{ opts.model_name }}_";
++    const favKey = storageKeyPrefix + "favorites";
++    const recentKey = storageKeyPrefix + "recent";
++    
++    let allChoices = [];
++    let favorites = JSON.parse(localStorage.getItem(favKey) || "[]");
++    let recent = JSON.parse(localStorage.getItem(recentKey) || "[]");
++    
++    const searchInput = document.getElementById('type-search');
++    const loadingSpinner = document.getElementById('loading-spinner');
++    const typeLists = document.getElementById('type-lists');
++    const categoriesContainer = document.getElementById('categories-container');
++    const favoritesContainer = document.getElementById('favorites-container');
++    const favoritesList = document.getElementById('favorites-list');
++    const recentContainer = document.getElementById('recent-container');
++    const recentList = document.getElementById('recent-list');
++    
++    function saveFavorites() {
++        localStorage.setItem(favKey, JSON.stringify(favorites));
++    }
++    
++    function saveRecent() {
++        localStorage.setItem(recentKey, JSON.stringify(recent));
++    }
++    
++    function addRecent(id) {
++        recent = recent.filter(r => r !== id);
++        recent.unshift(id);
++        if (recent.length > 5) recent = recent.slice(0, 5);
++        saveRecent();
++    }
++    
++    function toggleFavorite(id) {
++        if (favorites.includes(id)) {
++            favorites = favorites.filter(f => f !== id);
++        } else {
++            favorites.push(id);
++        }
++        saveFavorites();
++        render();
++    }
++    
++    function createTypeItem(choice) {
++        const li = document.createElement('li');
++        li.className = 'type-item';
++        
++        const a = document.createElement('a');
++        a.className = 'type-link';
++        a.textContent = choice.name;
++        
++        let targetUrl = "?ct_id=" + choice.id;
++        if (extraQs) {
++            targetUrl += "&" + extraQs;
++        }
++        a.href = targetUrl;
++        
++        a.addEventListener('click', function() {
++            addRecent(choice.id);
++        });
++        
++        const favBtn = document.createElement('button');
++        favBtn.className = 'fav-btn' + (favorites.includes(choice.id) ? ' active' : '');
++        favBtn.innerHTML = '★';
++        favBtn.title = favorites.includes(choice.id) ? "Remove from favorites" : "Add to favorites";
++        favBtn.addEventListener('click', function(e) {
++            e.preventDefault();
++            toggleFavorite(choice.id);
++        });
++        
++        li.appendChild(a);
++        li.appendChild(favBtn);
++        return li;
++    }
++    
++    function render() {
++        const query = searchInput.value.toLowerCase().trim();
++        
++        // Filter choices
++        const filtered = allChoices.filter(c => c.name.toLowerCase().includes(query));
++        
++        // Render Favorites
++        favoritesList.innerHTML = '';
++        const favChoices = filtered.filter(c => favorites.includes(c.id));
++        if (favChoices.length > 0 && !query) {
++            favoritesContainer.classList.remove('hidden');
++            favChoices.forEach(c => favoritesList.appendChild(createTypeItem(c)));
++        } else {
++            favoritesContainer.classList.add('hidden');
++        }
++        
++        // Render Recent
++        recentList.innerHTML = '';
++        const recentChoices = recent.map(id => filtered.find(c => c.id === id)).filter(Boolean);
++        if (recentChoices.length > 0 && !query) {
++            recentContainer.classList.remove('hidden');
++            recentChoices.forEach(c => recentList.appendChild(createTypeItem(c)));
++        } else {
++            recentContainer.classList.add('hidden');
++        }
++        
++        // Render Categories
++        categoriesContainer.innerHTML = '';
++        const byCategory = {};
++        filtered.forEach(c => {
++            if (!byCategory[c.category]) byCategory[c.category] = [];
++            byCategory[c.category].push(c);
++        });
++        
++        Object.keys(byCategory).sort().forEach(cat => {
++            const section = document.createElement('div');
++            section.className = 'category-section';
++            
++            const h2 = document.createElement('h2');
++            h2.textContent = cat;
++            section.appendChild(h2);
++            
++            const ul = document.createElement('ul');
++            ul.className = 'type-list';
++            byCategory[cat].forEach(c => {
++                ul.appendChild(createTypeItem(c));
++            });
++            section.appendChild(ul);
++            
++            categoriesContainer.appendChild(section);
++        });
++    }
++    
++    searchInput.addEventListener('input', render);
++    
++    // Fetch choices
++    fetch(asyncUrl)
++        .then(response => response.json())
++        .then(data => {
++            allChoices = data.choices;
++            loadingSpinner.classList.add('hidden');
++            
++            if (allChoices.length === 1) {
++                // Auto redirect if only one choice
++                let targetUrl = "?ct_id=" + allChoices[0].id;
++                if (extraQs) targetUrl += "&" + extraQs;
++                window.location.href = targetUrl;
++                return;
++            }
++            
++            typeLists.classList.remove('hidden');
++            render();
++        })
++        .catch(error => {
++            console.error('Error fetching type choices:', error);
++            loadingSpinner.textContent = 'Error loading types. Please try again.';
++        });
++});
++</script>
+ {% endblock %}
