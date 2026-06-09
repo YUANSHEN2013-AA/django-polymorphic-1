@@ -1,0 +1,888 @@
+diff --git a/src/polymorphic/admin/parentadmin.py b/src/polymorphic/admin/parentadmin.py
+index ebb725b..df9fd29 100644
+--- a/src/polymorphic/admin/parentadmin.py
++++ b/src/polymorphic/admin/parentadmin.py
+@@ -6,14 +6,17 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Any, Generic, cast
+ 
++from django import forms
++from django.apps import apps
+ from django.contrib import admin
+ from django.contrib.admin.helpers import AdminErrorList, AdminForm
+-from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
++from django.contrib.admin.templatetags.admin_urls import add_preserved_filters, admin_urlname
+ from django.contrib.contenttypes.models import ContentType
+ from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+ from django.db import models
+-from django.http import Http404, HttpResponseRedirect
++from django.http import Http404, HttpResponseRedirect, JsonResponse
+ from django.template.response import TemplateResponse
++from django.urls import path, reverse
+ from django.utils.encoding import force_str
+ from django.utils.translation import gettext_lazy as _
+ from typing_extensions import TypeVar
+@@ -67,6 +70,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+ 
+     add_type_template = None
+     add_type_form = PolymorphicModelChoiceForm
++    polymorphic_type_selector_media = forms.Media(
++        js=("polymorphic/js/polymorphic_type_selector.js",),
++        css={"all": ("polymorphic/css/polymorphic_type_selector.css",)},
++    )
+ 
+     #: The regular expression to filter the primary key in the URL.
+     #: This accepts only numbers as defensive measure against catch-all URLs.
+@@ -112,12 +119,20 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+ 
+         return self.child_models
+ 
+-    def get_child_type_choices(self, request, action):
++    def get_child_type_category(self, request, model, action, model_admin):
++        category = getattr(model_admin, "polymorphic_type_category", None)
++        if category:
++            return force_str(category)
++
++        app_config = apps.get_app_config(model._meta.app_label)
++        return force_str(app_config.verbose_name)
++
++    def get_child_type_data(self, request, action):
+         """
+-        Return a list of polymorphic types for which the user has the permission to perform the given action.
++        Return the structured type information used by the add-type selector UI.
+         """
+         self._lazy_setup()
+-        choices = []
++        data = []
+         content_types = ContentType.objects.get_for_models(
+             *self.get_child_models(), for_concrete_models=False
+         )
+@@ -128,8 +143,50 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             perm_function = getattr(model_admin, perm_function_name)
+             if not perm_function(request):
+                 continue
+-            choices.append((ct.id, model._meta.verbose_name))
+-        return choices
++
++            app_config = apps.get_app_config(model._meta.app_label)
++            label = force_str(model._meta.verbose_name)
++            category = force_str(self.get_child_type_category(request, model, action, model_admin))
++            search_text = " ".join(
++                {
++                    label,
++                    force_str(model._meta.verbose_name_plural),
++                    model._meta.object_name,
++                    model._meta.model_name,
++                    model._meta.label_lower,
++                    model._meta.app_label,
++                    force_str(app_config.verbose_name),
++                    category,
++                }
++            ).casefold()
++            data.append(
++                {
++                    "ct_id": ct.id,
++                    "label": label,
++                    "app_label": model._meta.app_label,
++                    "app_verbose_name": force_str(app_config.verbose_name),
++                    "model_name": model._meta.model_name,
++                    "object_name": model._meta.object_name,
++                    "model_label": model._meta.label_lower,
++                    "category": category,
++                    "search_text": search_text,
++                }
++            )
++
++        data.sort(key=lambda item: (item["category"], item["label"], item["model_name"]))
++        return data
++
++    def get_child_type_choices(self, request, action):
++        """
++        Return a list of polymorphic types for which the user has the permission to perform the given action.
++        """
++        return [(item["ct_id"], item["label"]) for item in self.get_child_type_data(request, action)]
++
++    def get_child_type_selector_storage_key(self):
++        return f"polymorphic.admin.{self.opts.label_lower}"
++
++    def get_child_type_selector_url(self):
++        return reverse(admin_urlname(self.opts, "type_options"), current_app=self.admin_site.name)
+ 
+     def _get_real_admin(self, object_id, super_if_self=True):
+         try:
+@@ -229,16 +286,36 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         real_admin = self._get_real_admin(object_id)
+         return real_admin.delete_view(request, object_id, extra_context)
+ 
++    def type_options_view(self, request):
++        if not self.has_add_permission(request):
++            raise PermissionDenied
++
++        query = request.GET.get("q", "").strip().casefold()
++        results = []
++        for item in self.get_child_type_data(request, "add"):
++            if query and query not in item["search_text"]:
++                continue
++            results.append({key: value for key, value in item.items() if key != "search_text"})
++
++        return JsonResponse({"results": results})
++
+     def get_urls(self):
+         """
+         Expose the custom URLs for the subclasses and the URL resolver.
+         """
++        custom_urls = [
++            path(
++                "add/type-options/",
++                self.admin_site.admin_view(self.type_options_view),
++                name=admin_urlname(self.opts, "type_options"),
++            )
++        ]
+         urls = super().get_urls()
+ 
+         # At this point. all admin code needs to be known.
+         self._lazy_setup()
+ 
+-        return urls
++        return custom_urls + urls
+ 
+     def add_type_view(self, request, form_url=""):
+         """
+@@ -273,7 +350,7 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         # Wrap in all admin layout
+         fieldsets = ((None, {"fields": ("ct_id",)}),)
+         adminForm = AdminForm(form, fieldsets, {}, model_admin=self)  # type: ignore[arg-type]
+-        media = self.media + adminForm.media
++        media = self.media + adminForm.media + self.polymorphic_type_selector_media
+         opts = self.model._meta
+ 
+         context = {
+@@ -283,6 +360,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             "media": media,
+             "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
+             "app_label": opts.app_label,
++            "type_selector_url": self.get_child_type_selector_url(),
++            "type_selector_storage_key": self.get_child_type_selector_storage_key(),
++            "type_selector_initial_ct_id": choices[0][0],
+         }
+         return self.render_add_type_form(request, context, form_url)
+ 
+diff --git a/src/polymorphic/static/polymorphic/css/polymorphic_type_selector.css b/src/polymorphic/static/polymorphic/css/polymorphic_type_selector.css
+new file mode 100644
+index 0000000..794eff2
+--- /dev/null
++++ b/src/polymorphic/static/polymorphic/css/polymorphic_type_selector.css
+@@ -0,0 +1,145 @@
++.polymorphic-type-selector {
++    display: none;
++    margin-bottom: 1.5rem;
++}
++
++.polymorphic-type-selector.is-active {
++    display: block;
++}
++
++.polymorphic-type-selector__toolbar {
++    display: flex;
++    flex-direction: column;
++    gap: 0.5rem;
++    margin-bottom: 1rem;
++}
++
++.polymorphic-type-selector__label {
++    font-weight: 600;
++}
++
++.polymorphic-type-selector__search {
++    width: 100%;
++    max-width: 36rem;
++    box-sizing: border-box;
++}
++
++.polymorphic-type-selector__status {
++    margin-bottom: 1rem;
++    color: var(--body-quiet-color);
++}
++
++.polymorphic-type-selector__sections {
++    display: grid;
++    gap: 1rem;
++}
++
++.polymorphic-type-selector__section {
++    border: 1px solid var(--hairline-color);
++    border-radius: 6px;
++    background: var(--body-bg);
++    overflow: hidden;
++}
++
++.polymorphic-type-selector__section-header {
++    margin: 0;
++    padding: 0.85rem 1rem;
++    border-bottom: 1px solid var(--hairline-color);
++    background: var(--darkened-bg);
++    font-size: 0.95rem;
++}
++
++.polymorphic-type-selector__section-body {
++    display: grid;
++    gap: 0.75rem;
++    padding: 1rem;
++}
++
++.polymorphic-type-selector__category-group {
++    display: grid;
++    gap: 0.5rem;
++}
++
++.polymorphic-type-selector__category-title {
++    margin: 0;
++    color: var(--body-quiet-color);
++    font-size: 0.85rem;
++    text-transform: uppercase;
++    letter-spacing: 0.04em;
++}
++
++.polymorphic-type-selector__options {
++    display: grid;
++    gap: 0.5rem;
++}
++
++.polymorphic-type-selector__option {
++    display: grid;
++    grid-template-columns: minmax(0, 1fr) auto;
++    gap: 0.75rem;
++    align-items: start;
++    padding: 0.75rem;
++    border: 1px solid var(--hairline-color);
++    border-radius: 6px;
++    background: var(--darkened-bg);
++}
++
++.polymorphic-type-selector__option.is-selected {
++    border-color: var(--primary);
++    box-shadow: 0 0 0 1px var(--primary);
++}
++
++.polymorphic-type-selector__select,
++.polymorphic-type-selector__favorite {
++    border: 0;
++    border-radius: 4px;
++    cursor: pointer;
++}
++
++.polymorphic-type-selector__select {
++    display: grid;
++    gap: 0.2rem;
++    align-items: start;
++    justify-items: start;
++    width: 100%;
++    padding: 0;
++    background: transparent;
++    color: inherit;
++    text-align: left;
++}
++
++.polymorphic-type-selector__name {
++    font-weight: 600;
++}
++
++.polymorphic-type-selector__meta {
++    color: var(--body-quiet-color);
++    font-size: 0.85rem;
++}
++
++.polymorphic-type-selector__favorite {
++    width: 2rem;
++    height: 2rem;
++    background: transparent;
++    color: var(--body-quiet-color);
++    font-size: 1.1rem;
++    line-height: 1;
++}
++
++.polymorphic-type-selector__favorite.is-favorite {
++    color: var(--primary);
++}
++
++.polymorphic-type-selector__empty,
++.polymorphic-type-selector__error {
++    padding: 1rem;
++    border: 1px dashed var(--hairline-color);
++    border-radius: 6px;
++    background: var(--darkened-bg);
++}
++
++@media (max-width: 767px) {
++    .polymorphic-type-selector__option {
++        grid-template-columns: minmax(0, 1fr);
++    }
++}
+diff --git a/src/polymorphic/static/polymorphic/js/polymorphic_type_selector.js b/src/polymorphic/static/polymorphic/js/polymorphic_type_selector.js
+new file mode 100644
+index 0000000..b9bc241
+--- /dev/null
++++ b/src/polymorphic/static/polymorphic/js/polymorphic_type_selector.js
+@@ -0,0 +1,353 @@
++(function() {
++    function parseStoredIds(key) {
++        try {
++            const value = window.localStorage.getItem(key);
++            if (!value) {
++                return [];
++            }
++            const parsed = JSON.parse(value);
++            if (!Array.isArray(parsed)) {
++                return [];
++            }
++            return parsed.map(String);
++        } catch (error) {
++            return [];
++        }
++    }
++
++    function storeIds(key, ids) {
++        try {
++            window.localStorage.setItem(key, JSON.stringify(ids));
++        } catch (error) {
++            return;
++        }
++    }
++
++    function debounce(callback, delay) {
++        let timer = null;
++        return function() {
++            window.clearTimeout(timer);
++            timer = window.setTimeout(() => callback.apply(this, arguments), delay);
++        };
++    }
++
++    function initTypeSelector(selector) {
++        const searchInput = selector.querySelector("[data-role='search']");
++        const statusNode = selector.querySelector("[data-role='status']");
++        const sectionsNode = selector.querySelector("[data-role='sections']");
++        const form = selector.closest("form");
++        const favoritesKey = `${selector.dataset.storageKey}:favorites`;
++        const recentKey = `${selector.dataset.storageKey}:recent`;
++        const radioSelector = "input[name='ct_id']";
++        let selectedId = selector.dataset.initialCtId || "";
++        let results = [];
++        let fetchToken = 0;
++
++        if (!searchInput || !statusNode || !sectionsNode || !form) {
++            return;
++        }
++
++        function getRadioInputs() {
++            return Array.from(document.querySelectorAll(radioSelector));
++        }
++
++        function getSelectedRadioId() {
++            const checked = getRadioInputs().find((radio) => radio.checked);
++            return checked ? checked.value : "";
++        }
++
++        function setSelectedRadio(id) {
++            getRadioInputs().forEach((radio) => {
++                radio.checked = radio.value === id;
++            });
++        }
++
++        function hideFallbackFieldset() {
++            getRadioInputs().forEach((radio) => {
++                const row = radio.closest(".form-row");
++                const fieldset = radio.closest("fieldset");
++                if (row) {
++                    row.hidden = true;
++                }
++                if (fieldset && fieldset.querySelectorAll(".form-row").length === 1) {
++                    fieldset.hidden = true;
++                }
++            });
++        }
++
++        function updateStatus(message) {
++            statusNode.textContent = message;
++        }
++
++        function getFavorites() {
++            return parseStoredIds(favoritesKey);
++        }
++
++        function setFavorites(ids) {
++            storeIds(favoritesKey, Array.from(new Set(ids)));
++        }
++
++        function getRecent() {
++            return parseStoredIds(recentKey);
++        }
++
++        function pushRecent(id) {
++            const ids = getRecent().filter((item) => item !== id);
++            ids.unshift(id);
++            storeIds(recentKey, ids.slice(0, 5));
++        }
++
++        function groupByCategory(items) {
++            return items.reduce((groups, item) => {
++                const group = groups[item.category] || [];
++                group.push(item);
++                groups[item.category] = group;
++                return groups;
++            }, {});
++        }
++
++        function createOption(item) {
++            const option = document.createElement("div");
++            option.className = "polymorphic-type-selector__option";
++            option.dataset.ctId = String(item.ct_id);
++            if (String(item.ct_id) === selectedId) {
++                option.classList.add("is-selected");
++            }
++
++            const selectButton = document.createElement("button");
++            selectButton.type = "button";
++            selectButton.className = "polymorphic-type-selector__select";
++            selectButton.dataset.role = "select";
++            selectButton.setAttribute("aria-label", `${selector.dataset.selectLabel}: ${item.label}`);
++            selectButton.addEventListener("click", () => {
++                selectedId = String(item.ct_id);
++                setSelectedRadio(selectedId);
++                renderSections(results);
++            });
++
++            const name = document.createElement("span");
++            name.className = "polymorphic-type-selector__name";
++            name.textContent = item.label;
++
++            const meta = document.createElement("span");
++            meta.className = "polymorphic-type-selector__meta";
++            meta.textContent = `${item.category} · ${item.object_name}`;
++
++            selectButton.appendChild(name);
++            selectButton.appendChild(meta);
++            option.appendChild(selectButton);
++
++            const favoriteButton = document.createElement("button");
++            favoriteButton.type = "button";
++            favoriteButton.className = "polymorphic-type-selector__favorite";
++            favoriteButton.dataset.role = "favorite";
++            favoriteButton.textContent = "★";
++
++            const favoriteIds = getFavorites();
++            const isFavorite = favoriteIds.includes(String(item.ct_id));
++            if (isFavorite) {
++                favoriteButton.classList.add("is-favorite");
++                favoriteButton.setAttribute("aria-label", selector.dataset.favoriteRemoveLabel);
++                favoriteButton.title = selector.dataset.favoriteRemoveLabel;
++            } else {
++                favoriteButton.setAttribute("aria-label", selector.dataset.favoriteAddLabel);
++                favoriteButton.title = selector.dataset.favoriteAddLabel;
++            }
++
++            favoriteButton.addEventListener("click", () => {
++                const itemId = String(item.ct_id);
++                const updatedFavorites = getFavorites();
++                const index = updatedFavorites.indexOf(itemId);
++                if (index >= 0) {
++                    updatedFavorites.splice(index, 1);
++                } else {
++                    updatedFavorites.unshift(itemId);
++                }
++                setFavorites(updatedFavorites);
++                renderSections(results);
++            });
++
++            option.appendChild(favoriteButton);
++            return option;
++        }
++
++        function createSection(title, items, sectionName) {
++            if (!items.length) {
++                return null;
++            }
++
++            const section = document.createElement("section");
++            section.className = "polymorphic-type-selector__section";
++            section.dataset.section = sectionName;
++
++            const header = document.createElement("h2");
++            header.className = "polymorphic-type-selector__section-header";
++            header.textContent = title;
++            section.appendChild(header);
++
++            const body = document.createElement("div");
++            body.className = "polymorphic-type-selector__section-body";
++            const options = document.createElement("div");
++            options.className = "polymorphic-type-selector__options";
++            items.forEach((item) => options.appendChild(createOption(item)));
++            body.appendChild(options);
++            section.appendChild(body);
++            return section;
++        }
++
++        function createCategorizedSection(items) {
++            if (!items.length) {
++                return null;
++            }
++
++            const section = document.createElement("section");
++            section.className = "polymorphic-type-selector__section";
++            section.dataset.section = "categories";
++
++            const header = document.createElement("h2");
++            header.className = "polymorphic-type-selector__section-header";
++            header.textContent = selector.dataset.categoriesLabel || selector.dataset.allTypesLabel;
++            section.appendChild(header);
++
++            const body = document.createElement("div");
++            body.className = "polymorphic-type-selector__section-body";
++            const grouped = groupByCategory(items);
++
++            Object.keys(grouped).sort().forEach((category) => {
++                const group = document.createElement("div");
++                group.className = "polymorphic-type-selector__category-group";
++
++                const title = document.createElement("h3");
++                title.className = "polymorphic-type-selector__category-title";
++                title.textContent = category;
++                group.appendChild(title);
++
++                const options = document.createElement("div");
++                options.className = "polymorphic-type-selector__options";
++                grouped[category].forEach((item) => options.appendChild(createOption(item)));
++                group.appendChild(options);
++                body.appendChild(group);
++            });
++
++            section.appendChild(body);
++            return section;
++        }
++
++        function renderSections(items) {
++            sectionsNode.innerHTML = "";
++            const itemMap = new Map(items.map((item) => [String(item.ct_id), item]));
++            const favorites = getFavorites().map((id) => itemMap.get(id)).filter(Boolean);
++            const recent = getRecent().map((id) => itemMap.get(id)).filter(Boolean);
++            const fragments = [
++                createSection(selector.dataset.favoritesLabel, favorites, "favorites"),
++                createSection(selector.dataset.recentLabel, recent, "recent"),
++                createCategorizedSection(items),
++            ].filter(Boolean);
++
++            if (!fragments.length) {
++                const empty = document.createElement("div");
++                empty.className = "polymorphic-type-selector__empty";
++                empty.textContent = selector.dataset.emptyLabel;
++                sectionsNode.appendChild(empty);
++                return;
++            }
++
++            fragments.forEach((fragment) => sectionsNode.appendChild(fragment));
++        }
++
++        function applyResults(newResults) {
++            results = newResults;
++            const currentRadioId = getSelectedRadioId();
++            if (currentRadioId) {
++                selectedId = currentRadioId;
++            } else if (!results.find((item) => String(item.ct_id) === selectedId) && results.length) {
++                selectedId = String(results[0].ct_id);
++                setSelectedRadio(selectedId);
++            } else if (selectedId) {
++                setSelectedRadio(selectedId);
++            }
++
++            renderSections(results);
++            updateStatus(results.length ? "" : selector.dataset.emptyLabel);
++            selector.classList.add("is-active");
++            hideFallbackFieldset();
++        }
++
++        function renderError() {
++            selector.classList.add("is-active");
++            sectionsNode.innerHTML = "";
++            const error = document.createElement("div");
++            error.className = "polymorphic-type-selector__error";
++            error.textContent = selector.dataset.errorLabel;
++            sectionsNode.appendChild(error);
++            updateStatus(selector.dataset.errorLabel);
++        }
++
++        function fetchResults(query) {
++            fetchToken += 1;
++            const token = fetchToken;
++            updateStatus(selector.dataset.loadingLabel);
++            const requestUrl = new URL(selector.dataset.fetchUrl, window.location.origin);
++            const currentUrl = new URL(window.location.href);
++
++            currentUrl.searchParams.forEach((value, key) => {
++                if (key !== "q") {
++                    requestUrl.searchParams.set(key, value);
++                }
++            });
++            if (query) {
++                requestUrl.searchParams.set("q", query);
++            }
++
++            window.fetch(requestUrl.toString(), {
++                headers: {
++                    "X-Requested-With": "XMLHttpRequest",
++                },
++                credentials: "same-origin",
++            })
++                .then((response) => {
++                    if (!response.ok) {
++                        throw new Error(`Request failed with status ${response.status}`);
++                    }
++                    return response.json();
++                })
++                .then((payload) => {
++                    if (token !== fetchToken) {
++                        return;
++                    }
++                    applyResults(payload.results || []);
++                })
++                .catch(() => {
++                    if (token !== fetchToken) {
++                        return;
++                    }
++                    renderError();
++                });
++        }
++
++        form.addEventListener("submit", () => {
++            const currentId = getSelectedRadioId() || selectedId;
++            if (currentId) {
++                pushRecent(currentId);
++            }
++        });
++
++        form.addEventListener("change", (event) => {
++            const target = event.target;
++            if (target && target.matches && target.matches(radioSelector)) {
++                selectedId = target.value;
++                renderSections(results);
++            }
++        });
++
++        searchInput.addEventListener("input", debounce((event) => {
++            fetchResults(event.target.value.trim());
++        }, 150));
++
++        fetchResults("");
++    }
++
++    document.addEventListener("DOMContentLoaded", () => {
++        document.querySelectorAll(".polymorphic-type-selector").forEach(initTypeSelector);
++    });
++})();
+diff --git a/src/polymorphic/templates/admin/polymorphic/add_type_form.html b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+index 20cc8ab..89ef595 100644
+--- a/src/polymorphic/templates/admin/polymorphic/add_type_form.html
++++ b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+@@ -1,4 +1,5 @@
+ {% extends "admin/change_form.html" %}
++{% load i18n %}
+ 
+ {% if save_on_top %}
+   {% block submit_buttons_top %}
+@@ -6,6 +7,46 @@
+   {% endblock %}
+ {% endif %}
+ 
++{% block field_sets %}
++  <div
++    class="polymorphic-type-selector"
++    data-fetch-url="{{ type_selector_url }}"
++    data-storage-key="{{ type_selector_storage_key }}"
++    data-initial-ct-id="{{ type_selector_initial_ct_id }}"
++    data-search-placeholder="{% translate 'Search by subclass name, app, or model' %}"
++    data-loading-label="{% translate 'Loading subclass types…' %}"
++    data-error-label="{% translate 'Could not load subclass types. The standard type chooser remains available below.' %}"
++    data-empty-label="{% translate 'No subclasses match the current search.' %}"
++    data-favorites-label="{% translate 'Favorites' %}"
++    data-recent-label="{% translate 'Recently used' %}"
++    data-categories-label="{% translate 'Categories' %}"
++    data-all-types-label="{% translate 'All subclasses' %}"
++    data-select-label="{% translate 'Select subclass' %}"
++    data-favorite-add-label="{% translate 'Add to favorites' %}"
++    data-favorite-remove-label="{% translate 'Remove from favorites' %}"
++  >
++    <div class="polymorphic-type-selector__toolbar">
++      <label class="polymorphic-type-selector__label" for="polymorphic-type-selector-search">
++        {% translate "Search subclasses" %}
++      </label>
++      <input
++        id="polymorphic-type-selector-search"
++        class="polymorphic-type-selector__search"
++        type="search"
++        autocomplete="off"
++        spellcheck="false"
++        placeholder="{% translate 'Search by subclass name, app, or model' %}"
++        data-role="search"
++      >
++    </div>
++    <div class="polymorphic-type-selector__status" data-role="status">
++      {% translate "Loading subclass types…" %}
++    </div>
++    <div class="polymorphic-type-selector__sections" data-role="sections"></div>
++  </div>
++  {{ block.super }}
++{% endblock %}
++
+ {% block submit_buttons_bottom %}
+   {% include 'admin/submit_line.html' with show_save=1 %}
+ {% endblock %}
+diff --git a/src/polymorphic/tests/test_admin.py b/src/polymorphic/tests/test_admin.py
+index bc5429c..28796c8 100644
+--- a/src/polymorphic/tests/test_admin.py
++++ b/src/polymorphic/tests/test_admin.py
+@@ -612,7 +612,9 @@ class PolymorphicFormTests(_GenericAdminFormTest):
+             expect(self.page.locator("div.breadcrumbs")).to_have_count(1)
+             expect(self.page.locator("form#logout-form")).to_have_count(1)
+ 
+-            self.page.locator(f"input[type=radio][value='{model_type.pk}']").check()
++            self.page.locator(
++                f".polymorphic-type-selector [data-ct-id='{model_type.pk}'] [data-role='select']"
++            ).click()
+             with self.page.expect_navigation(timeout=30000) as nav_info:
+                 self.page.click("input[name='_save']")
+ 
+@@ -682,7 +684,9 @@ class PolymorphicFormTests(_GenericAdminFormTest):
+         popup.wait_for_load_state("networkidle")
+ 
+         # In the popup, select Model2D type
+-        popup.locator(f"input[type=radio][value='{model2d_ct.pk}']").check()
++        popup.locator(
++            f".polymorphic-type-selector [data-ct-id='{model2d_ct.pk}'] [data-role='select']"
++        ).click()
+         with popup.expect_navigation(timeout=30000) as nav_info:
+             popup.click("input[name='_save']")
+ 
+@@ -790,7 +794,9 @@ class AdminRecentActionsTests(_GenericAdminFormTest):
+             ),
+         ]:
+             self.page.goto(self.add_url(Model2A))
+-            self.page.locator(f"input[type=radio][value='{model_type.pk}']").check()
++            self.page.locator(
++                f".polymorphic-type-selector [data-ct-id='{model_type.pk}'] [data-role='select']"
++            ).click()
+             with self.page.expect_navigation(timeout=30000) as nav_info:
+                 self.page.click("input[name='_save']")
+ 
+diff --git a/src/polymorphic/tests/test_admin_type_selector.py b/src/polymorphic/tests/test_admin_type_selector.py
+new file mode 100644
+index 0000000..e3064e2
+--- /dev/null
++++ b/src/polymorphic/tests/test_admin_type_selector.py
+@@ -0,0 +1,109 @@
++import json
++
++from django.contrib.admin.templatetags.admin_urls import admin_urlname
++from django.contrib.contenttypes.models import ContentType
++from django.urls import reverse
++from playwright.sync_api import expect
++
++from polymorphic.admin import PolymorphicChildModelAdmin, PolymorphicParentModelAdmin
++from polymorphic.tests.admintestcase import AdminTestCase
++from polymorphic.tests.models import Model2A, Model2B, Model2C, Model2D
++
++from .utils import _GenericUITest
++
++
++class PolymorphicTypeSelectorAdminTests(AdminTestCase):
++    def test_add_type_view_includes_type_selector_media(self):
++        @self.register(Model2A)
++        class Model2Admin(PolymorphicParentModelAdmin):
++            base_model = Model2A
++            child_models = (Model2B, Model2C, Model2D)
++
++        @self.register(Model2B)
++        @self.register(Model2C)
++        @self.register(Model2D)
++        class Model2ChildAdmin(PolymorphicChildModelAdmin):
++            base_model = Model2A
++
++        response = self.admin_get_add(Model2A)
++        response.render()
++
++        assert "polymorphic/js/polymorphic_type_selector.js" in response.rendered_content
++        assert "polymorphic/css/polymorphic_type_selector.css" in response.rendered_content
++
++    def test_type_options_view_returns_categories_and_filters(self):
++        @self.register(Model2A)
++        class Model2Admin(PolymorphicParentModelAdmin):
++            base_model = Model2A
++            child_models = (Model2B, Model2C, Model2D)
++
++        @self.register(Model2B)
++        class Model2BAdmin(PolymorphicChildModelAdmin):
++            base_model = Model2A
++            polymorphic_type_category = "Featured"
++
++        @self.register(Model2C)
++        @self.register(Model2D)
++        class Model2ChildAdmin(PolymorphicChildModelAdmin):
++            base_model = Model2A
++
++        admin_instance = self.get_admin_instance(Model2A)
++        type_options_url = reverse(admin_urlname(admin_instance.opts, "type_options"))
++        request = self.create_admin_request("get", f"{type_options_url}?q=Model2C")
++
++        response = admin_instance.type_options_view(request)
++        payload = json.loads(response.content)
++
++        assert response.status_code == 200
++        assert [item["object_name"] for item in payload["results"]] == ["Model2C"]
++
++        request = self.create_admin_request("get", type_options_url)
++        response = admin_instance.type_options_view(request)
++        payload = json.loads(response.content)
++        categories = {item["object_name"]: item["category"] for item in payload["results"]}
++
++        assert categories["Model2B"] == "Featured"
++        assert categories["Model2C"] == "Django Polymorphic"
++
++
++class PolymorphicTypeSelectorUITests(_GenericUITest):
++    def test_admin_type_selector_supports_search_favorites_and_recent(self):
++        model2c_ct = ContentType.objects.get_for_model(Model2C)
++        model2d_ct = ContentType.objects.get_for_model(Model2D)
++
++        self.page.goto(self.admin_url())
++        self.page.evaluate("window.localStorage.clear()")
++        self.page.goto(self.add_url(Model2A))
++
++        selector = self.page.locator(".polymorphic-type-selector")
++        search = selector.locator("#polymorphic-type-selector-search")
++
++        expect(selector).to_be_visible()
++        expect(selector.locator(f"[data-section='categories'] [data-ct-id='{model2c_ct.pk}']")).to_have_count(1)
++
++        search.fill("Model2C")
++        expect(selector.locator(f"[data-section='categories'] [data-ct-id='{model2c_ct.pk}']")).to_have_count(1)
++        expect(selector.locator(f"[data-section='categories'] [data-ct-id='{model2d_ct.pk}']")).to_have_count(0)
++
++        search.fill("")
++        favorite_button = selector.locator(
++            f"[data-section='categories'] [data-ct-id='{model2d_ct.pk}'] [data-role='favorite']"
++        )
++        favorite_button.click()
++        expect(selector.locator(f"[data-section='favorites'] [data-ct-id='{model2d_ct.pk}']")).to_have_count(1)
++
++        selector.locator(
++            f"[data-section='categories'] [data-ct-id='{model2d_ct.pk}'] [data-role='select']"
++        ).click()
++        with self.page.expect_navigation(timeout=30000) as nav_info:
++            self.page.click("input[name='_save']")
++
++        response = nav_info.value
++        assert response.status < 400
++        assert f"ct_id={model2d_ct.pk}" in self.page.url
++
++        self.page.goto(self.add_url(Model2A))
++        selector = self.page.locator(".polymorphic-type-selector")
++        expect(selector).to_be_visible()
++        expect(selector.locator(f"[data-section='favorites'] [data-ct-id='{model2d_ct.pk}']")).to_have_count(1)
++        expect(selector.locator(f"[data-section='recent'] [data-ct-id='{model2d_ct.pk}']")).to_have_count(1)
