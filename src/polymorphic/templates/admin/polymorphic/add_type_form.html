@@ -1,10 +1,51 @@
 {% extends "admin/change_form.html" %}
+{% load i18n %}
 
 {% if save_on_top %}
   {% block submit_buttons_top %}
     {% include 'admin/submit_line.html' with show_save=1 %}
   {% endblock %}
 {% endif %}
+
+{% block field_sets %}
+  <div
+    class="polymorphic-type-selector"
+    data-fetch-url="{{ type_selector_url }}"
+    data-storage-key="{{ type_selector_storage_key }}"
+    data-initial-ct-id="{{ type_selector_initial_ct_id }}"
+    data-search-placeholder="{% translate 'Search by subclass name, app, or model' %}"
+    data-loading-label="{% translate 'Loading subclass types…' %}"
+    data-error-label="{% translate 'Could not load subclass types. The standard type chooser remains available below.' %}"
+    data-empty-label="{% translate 'No subclasses match the current search.' %}"
+    data-favorites-label="{% translate 'Favorites' %}"
+    data-recent-label="{% translate 'Recently used' %}"
+    data-categories-label="{% translate 'Categories' %}"
+    data-all-types-label="{% translate 'All subclasses' %}"
+    data-select-label="{% translate 'Select subclass' %}"
+    data-favorite-add-label="{% translate 'Add to favorites' %}"
+    data-favorite-remove-label="{% translate 'Remove from favorites' %}"
+  >
+    <div class="polymorphic-type-selector__toolbar">
+      <label class="polymorphic-type-selector__label" for="polymorphic-type-selector-search">
+        {% translate "Search subclasses" %}
+      </label>
+      <input
+        id="polymorphic-type-selector-search"
+        class="polymorphic-type-selector__search"
+        type="search"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="{% translate 'Search by subclass name, app, or model' %}"
+        data-role="search"
+      >
+    </div>
+    <div class="polymorphic-type-selector__status" data-role="status">
+      {% translate "Loading subclass types…" %}
+    </div>
+    <div class="polymorphic-type-selector__sections" data-role="sections"></div>
+  </div>
+  {{ block.super }}
+{% endblock %}
 
 {% block submit_buttons_bottom %}
   {% include 'admin/submit_line.html' with show_save=1 %}

@@ -6,14 +6,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Generic, cast
 
+from django import forms
+from django.apps import apps
 from django.contrib import admin
 from django.contrib.admin.helpers import AdminErrorList, AdminForm
-from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
+from django.contrib.admin.templatetags.admin_urls import add_preserved_filters, admin_urlname
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.db import models
-from django.http import Http404, HttpResponseRedirect
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.template.response import TemplateResponse
+from django.urls import path, reverse
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
 from typing_extensions import TypeVar
@@ -67,6 +70,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
 
     add_type_template = None
     add_type_form = PolymorphicModelChoiceForm
+    polymorphic_type_selector_media = forms.Media(
+        js=("polymorphic/js/polymorphic_type_selector.js",),
+        css={"all": ("polymorphic/css/polymorphic_type_selector.css",)},
+    )
 
     #: The regular expression to filter the primary key in the URL.
     #: This accepts only numbers as defensive measure against catch-all URLs.
@@ -112,12 +119,20 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
 
         return self.child_models
 
-    def get_child_type_choices(self, request, action):
+    def get_child_type_category(self, request, model, action, model_admin):
+        category = getattr(model_admin, "polymorphic_type_category", None)
+        if category:
+            return force_str(category)
+
+        app_config = apps.get_app_config(model._meta.app_label)
+        return force_str(app_config.verbose_name)
+
+    def get_child_type_data(self, request, action):
         """
-        Return a list of polymorphic types for which the user has the permission to perform the given action.
+        Return the structured type information used by the add-type selector UI.
         """
         self._lazy_setup()
-        choices = []
+        data = []
         content_types = ContentType.objects.get_for_models(
             *self.get_child_models(), for_concrete_models=False
         )
@@ -128,8 +143,50 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             perm_function = getattr(model_admin, perm_function_name)
             if not perm_function(request):
                 continue
-            choices.append((ct.id, model._meta.verbose_name))
-        return choices
+
+            app_config = apps.get_app_config(model._meta.app_label)
+            label = force_str(model._meta.verbose_name)
+            category = force_str(self.get_child_type_category(request, model, action, model_admin))
+            search_text = " ".join(
+                {
+                    label,
+                    force_str(model._meta.verbose_name_plural),
+                    model._meta.object_name,
+                    model._meta.model_name,
+                    model._meta.label_lower,
+                    model._meta.app_label,
+                    force_str(app_config.verbose_name),
+                    category,
+                }
+            ).casefold()
+            data.append(
+                {
+                    "ct_id": ct.id,
+                    "label": label,
+                    "app_label": model._meta.app_label,
+                    "app_verbose_name": force_str(app_config.verbose_name),
+                    "model_name": model._meta.model_name,
+                    "object_name": model._meta.object_name,
+                    "model_label": model._meta.label_lower,
+                    "category": category,
+                    "search_text": search_text,
+                }
+            )
+
+        data.sort(key=lambda item: (item["category"], item["label"], item["model_name"]))
+        return data
+
+    def get_child_type_choices(self, request, action):
+        """
+        Return a list of polymorphic types for which the user has the permission to perform the given action.
+        """
+        return [(item["ct_id"], item["label"]) for item in self.get_child_type_data(request, action)]
+
+    def get_child_type_selector_storage_key(self):
+        return f"polymorphic.admin.{self.opts.label_lower}"
+
+    def get_child_type_selector_url(self):
+        return reverse(admin_urlname(self.opts, "type_options"), current_app=self.admin_site.name)
 
     def _get_real_admin(self, object_id, super_if_self=True):
         try:
@@ -229,16 +286,36 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         real_admin = self._get_real_admin(object_id)
         return real_admin.delete_view(request, object_id, extra_context)
 
+    def type_options_view(self, request):
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+
+        query = request.GET.get("q", "").strip().casefold()
+        results = []
+        for item in self.get_child_type_data(request, "add"):
+            if query and query not in item["search_text"]:
+                continue
+            results.append({key: value for key, value in item.items() if key != "search_text"})
+
+        return JsonResponse({"results": results})
+
     def get_urls(self):
         """
         Expose the custom URLs for the subclasses and the URL resolver.
         """
+        custom_urls = [
+            path(
+                "add/type-options/",
+                self.admin_site.admin_view(self.type_options_view),
+                name=admin_urlname(self.opts, "type_options"),
+            )
+        ]
         urls = super().get_urls()
 
         # At this point. all admin code needs to be known.
         self._lazy_setup()
 
-        return urls
+        return custom_urls + urls
 
     def add_type_view(self, request, form_url=""):
         """
@@ -273,7 +350,7 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         # Wrap in all admin layout
         fieldsets = ((None, {"fields": ("ct_id",)}),)
         adminForm = AdminForm(form, fieldsets, {}, model_admin=self)  # type: ignore[arg-type]
-        media = self.media + adminForm.media
+        media = self.media + adminForm.media + self.polymorphic_type_selector_media
         opts = self.model._meta
 
         context = {
@@ -283,6 +360,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             "media": media,
             "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
             "app_label": opts.app_label,
+            "type_selector_url": self.get_child_type_selector_url(),
+            "type_selector_storage_key": self.get_child_type_selector_storage_key(),
+            "type_selector_initial_ct_id": choices[0][0],
         }
         return self.render_add_type_form(request, context, form_url)
 

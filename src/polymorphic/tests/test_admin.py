@@ -612,7 +612,9 @@ class PolymorphicFormTests(_GenericAdminFormTest):
             expect(self.page.locator("div.breadcrumbs")).to_have_count(1)
             expect(self.page.locator("form#logout-form")).to_have_count(1)
 
-            self.page.locator(f"input[type=radio][value='{model_type.pk}']").check()
+            self.page.locator(
+                f".polymorphic-type-selector [data-ct-id='{model_type.pk}'] [data-role='select']"
+            ).click()
             with self.page.expect_navigation(timeout=30000) as nav_info:
                 self.page.click("input[name='_save']")
 
@@ -682,7 +684,9 @@ class PolymorphicFormTests(_GenericAdminFormTest):
         popup.wait_for_load_state("networkidle")
 
         # In the popup, select Model2D type
-        popup.locator(f"input[type=radio][value='{model2d_ct.pk}']").check()
+        popup.locator(
+            f".polymorphic-type-selector [data-ct-id='{model2d_ct.pk}'] [data-role='select']"
+        ).click()
         with popup.expect_navigation(timeout=30000) as nav_info:
             popup.click("input[name='_save']")
 
@@ -790,7 +794,9 @@ class AdminRecentActionsTests(_GenericAdminFormTest):
             ),
         ]:
             self.page.goto(self.add_url(Model2A))
-            self.page.locator(f"input[type=radio][value='{model_type.pk}']").check()
+            self.page.locator(
+                f".polymorphic-type-selector [data-ct-id='{model_type.pk}'] [data-role='select']"
+            ).click()
             with self.page.expect_navigation(timeout=30000) as nav_info:
                 self.page.click("input[name='_save']")
 
