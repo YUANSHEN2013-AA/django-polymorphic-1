@@ -238,7 +238,42 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         # At this point. all admin code needs to be known.
         self._lazy_setup()
 
-        return urls
+        from django.urls import path
+        info = self.model._meta.app_label, self.model._meta.model_name
+        my_urls = [
+            path('async-type-choices/', self.admin_site.admin_view(self.async_type_choices_view), name='%s_%s_async_choices' % info),
+        ]
+
+        return my_urls + urls
+
+    def async_type_choices_view(self, request):
+        from django.http import JsonResponse
+        self._lazy_setup()
+        choices = []
+        content_types = ContentType.objects.get_for_models(
+            *self.get_child_models(), for_concrete_models=False
+        )
+
+        for model, ct in content_types.items():
+            perm_function_name = "has_add_permission"
+            model_admin = self._get_real_admin_by_model(model)
+            perm_function = getattr(model_admin, perm_function_name)
+            if not perm_function(request):
+                continue
+            
+            category = getattr(model, "polymorphic_category", None)
+            if not category:
+                # Fallback to app_config verbose_name or app_label
+                from django.apps import apps
+                app_config = apps.get_app_config(model._meta.app_label)
+                category = app_config.verbose_name
+            
+            choices.append({
+                "id": ct.id,
+                "name": str(model._meta.verbose_name),
+                "category": str(category),
+            })
+        return JsonResponse({"choices": choices})
 
     def add_type_view(self, request, form_url=""):
         """
@@ -254,21 +289,26 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             # TODO: should this use a Django method instead of manipulating the string directly?
             extra_qs = f"&{force_str(request.META['QUERY_STRING'])}"
 
-        choices = self.get_child_type_choices(request, "add")
-        if len(choices) == 0:
-            raise PermissionDenied
-        if len(choices) == 1:
-            return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
+        if request.method == "POST":
+            choices = self.get_child_type_choices(request, "add")
+            if len(choices) == 0:
+                raise PermissionDenied
+            if len(choices) == 1:
+                return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
+            
+            form = self.add_type_form(
+                data=request.POST,
+                initial={"ct_id": choices[0][0]},
+            )
+            setattr(form.fields["ct_id"], "choices", choices)
 
-        # Create form
-        form = self.add_type_form(
-            data=request.POST if request.method == "POST" else None,
-            initial={"ct_id": choices[0][0]},
-        )
-        setattr(form.fields["ct_id"], "choices", choices)
-
-        if form.is_valid():
-            return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+            if form.is_valid():
+                return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+        else:
+            # For GET requests, we skip loading choices synchronously to support async loading in the UI.
+            # We still need a dummy form for the admin context.
+            form = self.add_type_form(initial={})
+            setattr(form.fields["ct_id"], "choices", [])
 
         # Wrap in all admin layout
         fieldsets = ((None, {"fields": ("ct_id",)}),)
@@ -284,6 +324,13 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
             "app_label": opts.app_label,
         }
+        
+        # Add the async choices URL to the context
+        from django.urls import reverse
+        info = self.model._meta.app_label, self.model._meta.model_name
+        async_choices_url = reverse(f"{self.admin_site.name}:{info[0]}_{info[1]}_async_choices")
+        context["async_choices_url"] = async_choices_url
+        
         return self.render_add_type_form(request, context, form_url)
 
     def render_add_type_form(self, request, context, form_url=""):
