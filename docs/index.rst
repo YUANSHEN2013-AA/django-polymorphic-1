@@ -120,6 +120,7 @@ Advanced topics
 
    formsets
    views
+   async
    migrating
    managers
    deletion
