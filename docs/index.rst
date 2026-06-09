@@ -99,6 +99,7 @@ Features
 * Formset support.
 * Uses the minimum amount of queries needed to fetch the inherited models.
 * Disabling polymorphic behavior when needed.
+* Full async ORM support (``aiterator``, ``aget``, ``afirst``, ``alast``, ``acount``, ``aexists``, ``aupdate``).
 
 
 Getting started
@@ -108,6 +109,7 @@ Getting started
    :maxdepth: 2
 
    quickstart
+   async_orm
    admin
    performance
    integrations/index

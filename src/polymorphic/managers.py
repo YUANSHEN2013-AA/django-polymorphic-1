@@ -192,6 +192,65 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
             nobj.refresh_from_db()  # cast to cls
             return nobj
 
+    # -------------------------------------------------------------------------
+    # Async ORM proxy methods
+    # -------------------------------------------------------------------------
+
+    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.get`.
+
+        Returns a single polymorphically downcast model instance.
+        """
+        return await self.get_queryset().aget(*args, **kwargs)
+
+    async def afirst(self) -> _All | None:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.first`.
+
+        Returns the first polymorphically downcast object matched by the
+        default queryset, or ``None``.
+        """
+        return await self.get_queryset().afirst()
+
+    async def alast(self) -> _All | None:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.last`.
+
+        Returns the last polymorphically downcast object matched by the
+        default queryset, or ``None``.
+        """
+        return await self.get_queryset().alast()
+
+    async def acount(self) -> int:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.count`.
+
+        Returns the number of objects in the default queryset.
+        """
+        return await self.get_queryset().acount()
+
+    async def aexists(self) -> bool:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.exists`.
+        """
+        return await self.get_queryset().aexists()
+
+    async def aupdate(self, **kwargs: Any) -> int:
+        """
+        Async version of :meth:`~django.db.models.query.QuerySet.update`.
+        """
+        return await self.get_queryset().aupdate(**kwargs)
+
+    def aiterator(self, chunk_size: int | None = None):
+        """
+        Async iterator via the default queryset.
+
+        Returns an async iterator that yields polymorphically downcast model
+        instances.
+        """
+        return self.get_queryset().aiterator(chunk_size=chunk_size)
+
 
 if TYPE_CHECKING:
     from django.db.models.fields.related_descriptors import (
