@@ -1,3 +1,665 @@
+diff --git a/1-3.patch b/1-3.patch
+new file mode 100644
+index 0000000..418c3dc
+--- /dev/null
++++ b/1-3.patch
+@@ -0,0 +1,391 @@
++diff --git a/docs/index.rst b/docs/index.rst
++index 5fc59eb..c006557 100644
++--- a/docs/index.rst
+++++ b/docs/index.rst
++@@ -99,6 +99,7 @@ Features
++ * Formset support.
++ * Uses the minimum amount of queries needed to fetch the inherited models.
++ * Disabling polymorphic behavior when needed.
+++* Full async ORM support (``aiterator``, ``aget``, ``afirst``, ``alast``, ``acount``, ``aexists``, ``aupdate``).
++ 
++ 
++ Getting started
++@@ -108,6 +109,7 @@ Getting started
++    :maxdepth: 2
++ 
++    quickstart
+++   async_orm
++    admin
++    performance
++    integrations/index
++diff --git a/src/polymorphic/managers.py b/src/polymorphic/managers.py
++index 82b4cfc..a81ab2e 100644
++--- a/src/polymorphic/managers.py
+++++ b/src/polymorphic/managers.py
++@@ -192,6 +192,65 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
++             nobj.refresh_from_db()  # cast to cls
++             return nobj
++ 
+++    # -------------------------------------------------------------------------
+++    # Async ORM proxy methods
+++    # -------------------------------------------------------------------------
+++
+++    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.get`.
+++
+++        Returns a single polymorphically downcast model instance.
+++        """
+++        return await self.get_queryset().aget(*args, **kwargs)
+++
+++    async def afirst(self) -> _All | None:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.first`.
+++
+++        Returns the first polymorphically downcast object matched by the
+++        default queryset, or ``None``.
+++        """
+++        return await self.get_queryset().afirst()
+++
+++    async def alast(self) -> _All | None:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.last`.
+++
+++        Returns the last polymorphically downcast object matched by the
+++        default queryset, or ``None``.
+++        """
+++        return await self.get_queryset().alast()
+++
+++    async def acount(self) -> int:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.count`.
+++
+++        Returns the number of objects in the default queryset.
+++        """
+++        return await self.get_queryset().acount()
+++
+++    async def aexists(self) -> bool:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.exists`.
+++        """
+++        return await self.get_queryset().aexists()
+++
+++    async def aupdate(self, **kwargs: Any) -> int:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.update`.
+++        """
+++        return await self.get_queryset().aupdate(**kwargs)
+++
+++    def aiterator(self, chunk_size: int | None = None):
+++        """
+++        Async iterator via the default queryset.
+++
+++        Returns an async iterator that yields polymorphically downcast model
+++        instances.
+++        """
+++        return self.get_queryset().aiterator(chunk_size=chunk_size)
+++
++ 
++ if TYPE_CHECKING:
++     from django.db.models.fields.related_descriptors import (
++diff --git a/src/polymorphic/query.py b/src/polymorphic/query.py
++index 7d55bd5..84f5319 100644
++--- a/src/polymorphic/query.py
+++++ b/src/polymorphic/query.py
++@@ -4,12 +4,14 @@ QuerySet for PolymorphicModel
++ 
++ from __future__ import annotations
++ 
+++import asyncio
++ import copy
++ import heapq
++ from collections import defaultdict
++ from collections.abc import Collection, Iterable, Iterator, Sequence
++ from typing import TYPE_CHECKING, Any, Generic, cast, overload
++ 
+++from asgiref.sync import sync_to_async
++ from django.contrib.contenttypes.models import ContentType
++ from django.core.exceptions import FieldDoesNotExist
++ from django.db import connections, models
++@@ -699,3 +701,281 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
++         disrupts the model hierarchy/relationship traversal.
++         """
++         return QuerySet.delete(self.non_polymorphic())
+++
+++    # -------------------------------------------------------------------------
+++    # Async ORM methods
+++    # -------------------------------------------------------------------------
+++
+++    async def aget(self, *args: Any, **kwargs: Any) -> _All:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.get`.
+++
+++        Returns a single polymorphically downcast model instance matching the
+++        given keyword arguments.
+++        """
+++        return await super().aget(*args, **kwargs)
+++
+++    async def afirst(self) -> _All | None:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.first`.
+++
+++        Returns the first polymorphically downcast object matched by the
+++        queryset, or ``None`` if there is no matching object.
+++        """
+++        return await super().afirst()
+++
+++    async def alast(self) -> _All | None:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.last`.
+++
+++        Returns the last polymorphically downcast object matched by the
+++        queryset, or ``None`` if there is no matching object.
+++        """
+++        return await super().alast()
+++
+++    async def acount(self) -> int:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.count`.
+++
+++        Returns the number of objects in the queryset, respecting
+++        :meth:`instance_of` and :meth:`not_instance_of` filters.
+++        """
+++        return await super().acount()
+++
+++    async def aexists(self) -> bool:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.exists`.
+++
+++        Returns ``True`` if the queryset contains any results, respecting
+++        :meth:`instance_of` and :meth:`not_instance_of` filters.
+++        """
+++        return await super().aexists()
+++
+++    async def aupdate(self, **kwargs: Any) -> int:
+++        """
+++        Async version of :meth:`~django.db.models.query.QuerySet.update`.
+++
+++        Updates all objects in the queryset with the given keyword arguments,
+++        respecting :meth:`instance_of` and :meth:`not_instance_of` filters.
+++        """
+++        return await super().aupdate(**kwargs)
+++
+++    async def aiterator(self, chunk_size: int | None = None):
+++        """
+++        Async iterator that yields polymorphically downcast model instances.
+++
+++        This method fetches objects in chunks and applies polymorphic
+++        downcasting, ensuring that each yielded object has its correct concrete
+++        class. It respects :meth:`select_related` configuration and
+++        :meth:`defer`/:meth:`only` field selections.
+++
+++        :param chunk_size: Number of base objects to fetch and downcast per
+++            database round-trip. If ``None``, the value of
+++            :attr:`Polymorphic_QuerySet_objects_per_request` is used, capped by
+++            ``connections[self.db].features.max_query_params``.
+++
+++        .. code-block:: python
+++
+++            async for obj in ModelA.objects.instance_of(ModelB).aiterator():
+++                process(obj)
+++        """
+++        if self.polymorphic_disabled:
+++            async for obj in super().aiterator(chunk_size=chunk_size):
+++                yield obj
+++            return
+++
+++        max_chunk = connections[self.db].features.max_query_params
+++        effective_chunk = chunk_size
+++        if max_chunk:
+++            effective_chunk = (
+++                max_chunk if chunk_size is None else min(max_chunk, chunk_size)
+++            )
+++        effective_chunk = effective_chunk or Polymorphic_QuerySet_objects_per_request
+++
+++        ct_data = await sync_to_async(self._prepare_ct_data)()
+++
+++        (
+++            self_model_class_id,
+++            self_concrete_model_class_id,
+++            ct_id_to_class,
+++            class_to_ct_ids,
+++            pk_name,
+++        ) = ct_data
+++
+++        base_qs = self.non_polymorphic().order_by(pk_name)
+++
+++        chunk: list[_All] = []
+++        async for base_obj in base_qs.aiterator(chunk_size=effective_chunk):
+++            chunk.append(base_obj)
+++            if len(chunk) >= effective_chunk:
+++                async for real_obj in self._aresolve_chunk(
+++                    chunk, self_model_class_id, self_concrete_model_class_id,
+++                    ct_id_to_class, class_to_ct_ids, pk_name,
+++                ):
+++                    yield real_obj
+++                chunk = []
+++
+++        if chunk:
+++            async for real_obj in self._aresolve_chunk(
+++                chunk, self_model_class_id, self_concrete_model_class_id,
+++                ct_id_to_class, class_to_ct_ids, pk_name,
+++            ):
+++                yield real_obj
+++
+++    def _prepare_ct_data(self):
+++        content_type_manager = ContentType.objects.db_manager(self.db)
+++        self_model_class_id = content_type_manager.get_for_model(
+++            self.model, for_concrete_model=False
+++        ).pk
+++        self_concrete_model_class_id = content_type_manager.get_for_model(
+++            self.model, for_concrete_model=True
+++        ).pk
+++
+++        ct_id_to_class: dict[int, type[PolymorphicModel]] = {}
+++        class_to_ct_ids: dict[type[PolymorphicModel], set[int]] = {}
+++        for descendant in concrete_descendants(self.model):
+++            ct = content_type_manager.get_for_model(
+++                cast("type[models.Model]", descendant), for_concrete_model=True
+++            )
+++            ct_id = ct.pk
+++            ct_id_to_class[ct_id] = descendant
+++            class_to_ct_ids.setdefault(descendant, set()).add(ct_id)
+++
+++        pk_name = self.model._meta.pk.attname
+++        return (
+++            self_model_class_id,
+++            self_concrete_model_class_id,
+++            ct_id_to_class,
+++            class_to_ct_ids,
+++            pk_name,
+++        )
+++
+++    async def _aresolve_chunk(
+++        self,
+++        base_objects: list[_All],
+++        self_model_class_id: int,
+++        self_concrete_model_class_id: int,
+++        ct_id_to_class: dict[int, type[PolymorphicModel]],
+++        class_to_ct_ids: dict[type[PolymorphicModel], set[int]],
+++        pk_name: str,
+++    ):
+++        """
+++        Resolve a chunk of base objects to their concrete polymorphic
+++        instances using parallel async database queries.
+++
+++        Groups base objects by concrete class, fetches concrete instances
+++        with async ORM queries executed concurrently, and yields results
+++        in the original order.
+++        """
+++        if not base_objects:
+++            return
+++
+++        idlist_per_model: defaultdict[type, list[Any]] = defaultdict(list)
+++        indexlist_per_model: defaultdict[type, list[int]] = defaultdict(list)
+++
+++        resultlist: list[Any] = []
+++
+++        for i, base_object in enumerate(base_objects):
+++            ct_id = base_object.polymorphic_ctype_id
+++            if ct_id == self_model_class_id:
+++                resultlist.append(base_object)
+++                continue
+++
+++            if ct_id == self_concrete_model_class_id:
+++                real_concrete_class = ct_id_to_class.get(ct_id, self.model)
+++                resultlist.append(
+++                    transmogrify(
+++                        cast("type[PolymorphicModel]", real_concrete_class), base_object
+++                    )
+++                )
+++                continue
+++
+++            real_concrete_class = ct_id_to_class.get(ct_id)
+++            if real_concrete_class is not None:
+++                idlist_per_model[real_concrete_class].append(getattr(base_object, pk_name))
+++                indexlist_per_model[real_concrete_class].append(i)
+++                resultlist.append(None)
+++            else:
+++                resultlist.append(base_object)
+++
+++        async def _fetch_model_instances(cls, pks):
+++            qs = cls._base_objects.db_manager(self.db).filter(
+++                **{f"{pk_name}__in": pks}
+++            )
+++            if self.query.select_related:
+++                qs.query.select_related = self.query.select_related
+++
+++            deferred_loading_fields: list[str] = []
+++            existing_fields = self.polymorphic_deferred_loading[0]
+++            for field in existing_fields:
+++                try:
+++                    translated = translate_polymorphic_field_path(cls, field)
+++                except AssertionError:
+++                    if "___" in field:
+++                        translated = field.rpartition("___")[-1]
+++                        try:
+++                            cls._meta.get_field(translated)
+++                        except FieldDoesNotExist:
+++                            continue
+++                    else:
+++                        raise
+++                deferred_loading_fields.append(translated)
+++
+++            qs.query.deferred_loading = (
+++                set(deferred_loading_fields),
+++                self.query.deferred_loading[1],
+++            )
+++
+++            result: dict[Any, Any] = {}
+++            async for real_obj in qs.aiterator():
+++                real_obj = copy.copy(real_obj)
+++                result[getattr(real_obj, pk_name)] = real_obj
+++            return cls, result
+++
+++        if idlist_per_model:
+++            coros = [
+++                _fetch_model_instances(cls, pks)
+++                for cls, pks in idlist_per_model.items()
+++            ]
+++            fetched_results = await asyncio.gather(*coros)
+++
+++            for cls, real_obj_map in fetched_results:
+++                for idx in indexlist_per_model[cls]:
+++                    base_object = base_objects[idx]
+++                    o_pk = getattr(base_object, pk_name)
+++                    real_obj = real_obj_map.get(o_pk)
+++                    if real_obj is not None:
+++                        real_ct_id = real_obj.polymorphic_ctype_id
+++                        expected_ct_ids = class_to_ct_ids.get(cls, set())
+++                        if real_ct_id not in expected_ct_ids:
+++                            real_cls = ct_id_to_class.get(real_ct_id)
+++                            if real_cls is not None:
+++                                real_obj = transmogrify(
+++                                    cast("type[PolymorphicModel]", real_cls), real_obj
+++                                )
+++                        if self.query.annotations:
+++                            annotation_select = getattr(
+++                                self.query, "annotation_select", self.query.annotations
+++                            )
+++                            for anno_field_name in annotation_select.keys():
+++                                if hasattr(base_object, anno_field_name):
+++                                    setattr(
+++                                        real_obj,
+++                                        anno_field_name,
+++                                        getattr(base_object, anno_field_name),
+++                                    )
+++                        if self.query.extra_select:
+++                            for select_field_name in self.query.extra_select.keys():
+++                                if hasattr(base_object, select_field_name):
+++                                    setattr(
+++                                        real_obj,
+++                                        select_field_name,
+++                                        getattr(base_object, select_field_name),
+++                                    )
+++                        resultlist[idx] = real_obj
+++                    else:
+++                        resultlist[idx] = base_object
+++
+++        for obj in resultlist:
+++            if obj is not None:
+++                yield obj
+diff --git a/docs/async_orm.rst b/docs/async_orm.rst
+new file mode 100644
+index 0000000..1877902
+--- /dev/null
++++ b/docs/async_orm.rst
+@@ -0,0 +1,258 @@
++.. _async-orm:
++
++Async ORM Support
++=================
++
++django-polymorphic fully supports Django's async ORM interface.
++All polymorphic querysets and managers expose async variants of the
++common query methods, preserving polymorphic downcast behavior.
++
++
++Quick Example
++-------------
++
++.. code-block:: python
++
++    async def list_projects():
++        async for obj in Project.objects.all().aiterator():
++            print(type(obj))  # ArtProject, ResearchProject, etc.
++
++    async def get_project(pk):
++        return await Project.objects.aget(pk=pk)  # Returns concrete type
++
++    async def count_art_projects():
++        return await Project.objects.instance_of(ArtProject).acount()
++
++
++Async Methods
++-------------
++
++All methods are direct async implementations (NOT ``sync_to_async`` wrappers
++of the synchronous versions). The following async methods are available:
++
++``aiterator()``
++~~~~~~~~~~~~~~~~
++
++Yields polymorphically downcast model instances asynchronously:
++
++.. code-block:: python
++
++    async for obj in Project.objects.all().aiterator():
++        process(obj)
++
++    async for obj in Project.objects.instance_of(ArtProject).aiterator():
++        process(obj)
++
++**Parameters:**
++
++* ``chunk_size``: Number of base objects to fetch per database round-trip.
++  Defaults to ``Polymorphic_QuerySet_objects_per_request``, capped by
++  ``connections[self.db].features.max_query_params``.
++
++**Notes:**
++
++* Respects ``select_related`` queries and ``defer``/``only`` field selections
++* Applies polymorphic downcasting in a single batch per chunk
++* Iterates in ascending primary key order
++
++``aget(*args, **kwargs)``
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Returns a single polymorphically downcast model instance:
++
++.. code-block:: python
++
++    obj = await Project.objects.aget(pk=1)
++    # obj is ArtProject, ResearchProject, etc.
++
++    obj = await Project.objects.instance_of(ArtProject).aget(pk=2)
++    # obj is guaranteed to be ArtProject
++
++``afirst()``
++~~~~~~~~~~~~~
++
++Returns the first matching polymorphically downcast object, or ``None``:
++
++.. code-block:: python
++
++    first = await Project.objects.afirst()
++
++``alast()``
++~~~~~~~~~~~~
++
++Returns the last matching polymorphically downcast object, or ``None``:
++
++.. code-block:: python
++
++    last = await Project.objects.alast()
++
++``acount()``
++~~~~~~~~~~~~~
++
++Returns the number of objects in the queryset, respecting ``instance_of``
++and ``not_instance_of`` filters:
++
++.. code-block:: python
++
++    total = await Project.objects.acount()
++    art_count = await Project.objects.instance_of(ArtProject).acount()
++
++``aexists()``
++~~~~~~~~~~~~~
++
++Returns ``True`` if the queryset has results:
++
++.. code-block:: python
++
++    if await Project.objects.filter(topic="AI").aexists():
++        ...
++
++``aupdate(**kwargs)``
++~~~~~~~~~~~~~~~~~~~~~
++
++Updates all matching objects and returns the count:
++
++.. code-block:: python
++
++    updated = await Project.objects.instance_of(ArtProject).aupdate(
++        topic="Updated Art"
++    )
++
++
++Manager Proxy
++-------------
++
++The :class:`~polymorphic.managers.PolymorphicManager` exposes all async
++methods directly, so you can call them without ``.all()``:
++
++.. code-block:: python
++
++    # These are equivalent:
++    await Project.objects.aget(pk=1)
++    await Project.objects.all().aget(pk=1)
++
++
++Filtering (instance_of / not_instance_of)
++------------------------------------------
++
++Async methods fully respect ``instance_of()`` and ``not_instance_of()``
++filters, just like their synchronous counterparts:
++
++.. code-block:: python
++
++    # Only ArtProject and ResearchProject
++    qs = Project.objects.instance_of(ArtProject, ResearchProject)
++    count = await qs.acount()
++
++    # Exclude ArtProject
++    qs = Project.objects.not_instance_of(ArtProject)
++    async for obj in qs.aiterator():
++        ...
++
++
++Union / Intersection
++---------------------
++
++Async operations work on union and intersection querysets:
++
++.. code-block:: python
++
++    qs1 = Project.objects.filter(topic__startswith="A")
++    qs2 = Project.objects.filter(topic__startswith="B")
++    union = qs1.union(qs2)
++    count = await union.acount()
++
++
++select_related / prefetch_related
++----------------------------------
++
++Both ``select_related`` and ``prefetch_related`` are respected during
++async iteration:
++
++.. code-block:: python
++
++    # select_related: joins are preserved in the async iteration
++    qs = Project.objects.select_related("related_model")
++    async for obj in qs.aiterator():
++        print(obj.related_model)
++
++    # prefetch_related: prefetched relations are available
++    qs = Project.objects.prefetch_related("related_set")
++    async for obj in qs.aiterator():
++        print(obj.related_set.all())
++
++
++Cross-Database Routing
++-----------------------
++
++Async operations respect database routing:
++
++.. code-block:: python
++
++    qs = Project.objects.using("secondary")
++    async for obj in qs.aiterator():
++        ...
++
++
++QuerySet Clone Logic
++--------------------
++
++All ``_clone`` operations preserve the polymorphic state
++(``polymorphic_disabled``, ``polymorphic_deferred_loading``) ensuring
++that chaining methods behave correctly:
++
++.. code-block:: python
++
++    qs = Project.objects.all().instance_of(ArtProject)
++    cloned = qs.order_by("pk")
++    # cloned still only returns ArtProject instances
++
++
++Non-Polymorphic Mode
++---------------------
++
++You can disable polymorphic downcasting in async mode using
++``non_polymorphic()``:
++
++.. code-block:: python
++
++    async for obj in Project.objects.non_polymorphic().aiterator():
++        # All objects are base Project instances
++        assert type(obj) == Project
++
++
++Django Compatibility
++---------------------
++
++Async ORM support is compatible with all supported Django versions:
++
++* Django 4.2
++* Django 5.2
++* Django 6.0
++
++
++Performance Considerations
++--------------------------
++
++* Async iteration fetches objects in chunks and applies polymorphic
++  downcasting within each chunk
++* The chunk size can be tuned via the ``chunk_size`` parameter
++* For small result sets, the overhead of chunking is minimal
++* For large result sets, chunking improves memory efficiency
++
++See :ref:`performance` for general performance guidance.
++
++
++Upgrade Guide
++-------------
++
++No changes are required to existing synchronous code. Async support is
++fully additive and backward compatible.
++
++To start using async:
++
++1. Ensure your Django version is 4.2 or higher
++2. Use ``async`` function definitions where you call async methods
++3. Use ``async for`` with ``aiterator()`` instead of ``for obj in qs``
++
++Existing synchronous code continues to work without any changes.
+\ No newline at end of file
 diff --git a/docs/index.rst b/docs/index.rst
 index 5fc59eb..c006557 100644
 --- a/docs/index.rst
@@ -389,3 +1051,572 @@ index 7d55bd5..84f5319 100644
 +        for obj in resultlist:
 +            if obj is not None:
 +                yield obj
+diff --git a/src/polymorphic/tests/benchmark_async.py b/src/polymorphic/tests/benchmark_async.py
+new file mode 100644
+index 0000000..ada82d7
+--- /dev/null
++++ b/src/polymorphic/tests/benchmark_async.py
+@@ -0,0 +1,140 @@
++"""
++Performance benchmark for async ORM.
++"""
++
++import time
++import asyncio
++from typing import Callable
++
++from django.db import connections
++from django.db.models import QuerySet
++from polymorphic.tests.models import Model2A, Model2B, Model2C, Model2D
++
++
++def setup_data(count: int = 1000):
++    """Create benchmark data."""
++    for idx in range(count):
++        Model2A.objects.create(field1=f"A{idx}")
++        Model2B.objects.create(field1=f"A{idx}", field2=f"B{idx}")
++        Model2C.objects.create(field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}")
++        Model2D.objects.create(
++            field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}", field4=f"D{idx}"
++        )
++
++
++async def benchmark_async_iteration(qs: QuerySet, chunk_size: int | None = None) -> float:
++    """Benchmark async iteration."""
++    start = time.perf_counter()
++    count = 0
++    async for obj in qs.order_by("pk").aiterator(chunk_size=chunk_size):
++        _ = obj.pk
++        count += 1
++    end = time.perf_counter()
++    return end - start
++
++
++def benchmark_sync_iteration(qs: QuerySet) -> float:
++    """Benchmark sync iteration for comparison."""
++    start = time.perf_counter()
++    count = 0
++    for obj in qs.order_by("pk").iterator():
++        _ = obj.pk
++        count += 1
++    end = time.perf_counter()
++    return end - start
++
++
++async def benchmark_async_methods():
++    """Benchmark individual async methods."""
++    results = {}
++
++    qs_all = Model2A.objects.all()
++    qs_b = Model2A.objects.instance_of(Model2B)
++
++    start = time.perf_counter()
++    count = await qs_all.acount()
++    end = time.perf_counter()
++    results["acount_all"] = end - start
++
++    start = time.perf_counter()
++    exists = await qs_all.filter(pk=1).aexists()
++    end = time.perf_counter()
++    results["aexists"] = end - start
++
++    start = time.perf_counter()
++    obj = await qs_all.aget(pk=1)
++    end = time.perf_counter()
++    results["aget"] = end - start
++
++    start = time.perf_counter()
++    first = await qs_all.afirst()
++    end = time.perf_counter()
++    results["afirst"] = end - start
++
++    start = time.perf_counter()
++    last = await qs_all.alast()
++    end = time.perf_counter()
++    results["alast"] = end - start
++
++    start = time.perf_counter()
++    updated = await qs_b.filter(pk__lte=100).aupdate(field2="updated")
++    end = time.perf_counter()
++    results["aupdate"] = end - start
++
++    return results
++
++
++def run_benchmark():
++    """Run the full benchmark suite."""
++    print("=" * 60)
++    print("django-polymorphic Async ORM Performance Benchmark")
++    print("=" * 60)
++
++    with connections["default"].schema_editor():
++        setup_data(1000)
++        print(f"\nCreated 4000 total objects (1000 of each type)\n")
++
++        print("Query count verification:")
++        from django.test.utils import CaptureQueriesContext
++        from django.db import connection
++
++        with CaptureQueriesContext(connection) as ctx:
++            asyncio.run(list(Model2A.objects.all().aiterator()))
++        print(f"Full iteration total queries: {len(ctx)}")
++
++        print("\n")
++        print("Benchmarking iteration...")
++
++        sync_time = benchmark_sync_iteration(Model2A.objects.all())
++        print(f"  Sync iterator  : {sync_time:.3f}s")
++
++        async_time_full = asyncio.run(benchmark_async_iteration(Model2A.objects.all()))
++        print(f"  Async aiterator : {async_time_full:.3f}s")
++
++        async_time_100 = asyncio.run(benchmark_async_iteration(Model2A.objects.all(), 100))
++        print(f"  Async (chunk 100): {async_time_100:.3f}s")
++
++        async_time_500 = asyncio.run(benchmark_async_iteration(Model2A.objects.all(), 500))
++        print(f"  Async (chunk 500): {async_time_500:.3f}s")
++
++        print("\nBenchmarking individual async methods...")
++        method_results = asyncio.run(benchmark_async_methods())
++        for name, duration in method_results.items():
++            print(f"  {name:<12} : {duration:.4f}s")
++
++        print("\nBenchmarking filtered queries...")
++
++        async_time_b = asyncio.run(benchmark_async_iteration(Model2A.objects.instance_of(Model2B)))
++        print(f"  instance_of(Model2B): {async_time_b:.3f}s")
++
++        async_time_d = asyncio.run(benchmark_async_iteration(Model2A.objects.instance_of(Model2D)))
++        print(f"  instance_of(Model2D): {async_time_d:.3f}s")
++
++        print("\n" + "=" * 60)
++        print("Summary:")
++        print(f"  Async / Sync ratio: {async_time_full / sync_time:.2f}x")
++        print("=" * 60)
++
++
++if __name__ == "__main__":
++    run_benchmark()
+diff --git a/src/polymorphic/tests/test_async_orm.py b/src/polymorphic/tests/test_async_orm.py
+new file mode 100644
+index 0000000..55cd4a5
+--- /dev/null
++++ b/src/polymorphic/tests/test_async_orm.py
+@@ -0,0 +1,416 @@
++"""
++Tests for async ORM support.
++"""
++
++import asyncio
++
++from django.db import models
++from django.test import TransactionTestCase
++
++from polymorphic.tests.models import (
++    Model2A,
++    Model2B,
++    Model2C,
++    Model2D,
++    BlogBase,
++    BlogA,
++    BlogB,
++    BlogEntry,
++)
++
++
++
++
++
++class AsyncPolymorphicQuerySetTests(TransactionTestCase):
++    """
++    Test async ORM methods on PolymorphicQuerySet.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++
++    def setUp(self):
++        for idx in range(10):
++            Model2A.objects.create(field1=f"A{idx}")
++            Model2B.objects.create(field1=f"A{idx}", field2=f"B{idx}")
++            Model2C.objects.create(field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}")
++            Model2D.objects.create(
++                field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}", field4=f"D{idx}"
++            )
++
++    def test_aget(self):
++        """Test async aget method with polymorphic downcasting."""
++        obj = Model2B.objects.create(field1="aget_test", field2="aget_test")
++
++        async def _test():
++            result = await Model2B.objects.aget(pk=obj.pk)
++            assert result is not None
++            assert result.pk == obj.pk
++            assert result.__class__ is Model2B
++            assert hasattr(result, "field2")
++            assert result.field2 == "aget_test"
++
++            result_from_base = await Model2A.objects.aget(pk=obj.pk)
++            assert result_from_base.__class__ is Model2B
++
++        asyncio.run(_test())
++
++    def test_afirst(self):
++        """Test async afirst method with polymorphic downcasting."""
++        async def _test():
++            first = await Model2A.objects.order_by("pk").afirst()
++            assert first is not None
++            assert first.field1 == "A0"
++            assert first.__class__ == Model2A
++
++            first_b = await Model2B.objects.order_by("pk").afirst()
++            assert first_b is not None
++            assert first_b.__class__ == Model2B
++
++        asyncio.run(_test())
++
++    def test_alast(self):
++        """Test async alast method with polymorphic downcasting."""
++        async def _test():
++            last = await Model2D.objects.order_by("pk").alast()
++            assert last is not None
++            assert last.field1 == "A9"
++            assert last.__class__ == Model2D
++
++        asyncio.run(_test())
++
++    def test_acount(self):
++        """Test async acount method with instance_of filtering."""
++        async def _test():
++            count = await Model2A.objects.acount()
++            assert count == 40
++
++            count_b = await Model2A.objects.instance_of(Model2B).acount()
++            assert count_b == 30
++
++            count_c = await Model2A.objects.instance_of(Model2C).acount()
++            assert count_c == 20
++
++            count_d = await Model2A.objects.instance_of(Model2D).acount()
++            assert count_d == 10
++
++            count_not_d = await Model2A.objects.not_instance_of(Model2D).acount()
++            assert count_not_d == 30
++
++        asyncio.run(_test())
++
++    def test_aexists(self):
++        """Test async aexists method."""
++        async def _test():
++            exists = await Model2A.objects.filter(field1="A0").aexists()
++            assert exists is True
++
++            not_exists = await Model2A.objects.filter(field1="nonexistent").aexists()
++            assert not_exists is False
++
++            exists_b = await Model2A.objects.instance_of(Model2B).aexists()
++            assert exists_b is True
++
++        asyncio.run(_test())
++
++    def test_aupdate(self):
++        """Test async aupdate method."""
++        async def _test():
++            updated = await Model2A.objects.filter(field1__startswith="A").aupdate(
++                field1="updated_sync"
++            )
++            assert updated == 40
++
++            first = await Model2A.objects.aget(pk=1)
++            assert first.field1 == "updated_sync"
++
++            updated_b = await Model2A.objects.instance_of(Model2B).filter(
++                pk__lte=10
++            ).aupdate(field2="b_updated")
++            assert updated_b == 10
++
++        asyncio.run(_test())
++
++    def test_aiterator_basic(self):
++        """Test async aiterator yields polymorphically downcast instances."""
++        async def _test():
++            count = 0
++            async for obj in Model2A.objects.order_by("pk").aiterator():
++                count += 1
++                assert hasattr(obj, "field1")
++                if isinstance(obj, Model2D):
++                    assert hasattr(obj, "field4")
++            assert count == 40
++
++        asyncio.run(_test())
++
++    def test_aiterator_chunked(self):
++        """Test async aiterator with custom chunk_size."""
++        async def _test():
++            count = 0
++            async for obj in Model2A.objects.order_by("pk").aiterator(chunk_size=5):
++                count += 1
++            assert count == 40
++
++        asyncio.run(_test())
++
++    def test_aiterator_small_chunk(self):
++        """Test async aiterator with chunk_size=1."""
++        async def _test():
++            count = 0
++            async for obj in Model2A.objects.order_by("pk").aiterator(chunk_size=1):
++                count += 1
++            assert count == 40
++
++        asyncio.run(_test())
++
++    def test_aiterator_non_polymorphic(self):
++        """Test async aiterator with non-polymorphic query."""
++        async def _test():
++            count = 0
++            async for obj in Model2A.objects.non_polymorphic().order_by("pk").aiterator():
++                count += 1
++                assert obj.__class__ == Model2A
++            assert count == 40
++
++        asyncio.run(_test())
++
++    def test_aiterator_instance_of(self):
++        """Test async aiterator with instance_of filtering."""
++        async def _test():
++            results = []
++            async for obj in (
++                Model2A.objects.instance_of(Model2C, Model2D).order_by("pk").aiterator()
++            ):
++                results.append(obj)
++
++            assert len(results) == 30
++            for obj in results:
++                assert obj.__class__ in (Model2C, Model2D)
++
++        asyncio.run(_test())
++
++    def test_aiterator_not_instance_of(self):
++        """Test async aiterator with not_instance_of filtering."""
++        async def _test():
++            results = []
++            async for obj in (
++                Model2A.objects.not_instance_of(Model2D).order_by("pk").aiterator()
++            ):
++                results.append(obj)
++
++            assert len(results) == 30
++            for obj in results:
++                assert not isinstance(obj, Model2D)
++
++        asyncio.run(_test())
++
++    def test_aiterator_select_related(self):
++        """Test async aiterator with select_related."""
++        async def _test():
++            blog_a = BlogA.objects.create(name="sr_a", info="sr_a")
++            BlogEntry.objects.create(blog=blog_a, text="sr_entry")
++
++            results = []
++            async for obj in (
++                BlogBase.objects.select_related().order_by("pk").aiterator()
++            ):
++                results.append(obj)
++
++            assert len(results) == 1
++            assert results[0].__class__ == BlogA
++
++        asyncio.run(_test())
++
++    def test_manager_async_proxies(self):
++        """Test that manager proxies async methods correctly."""
++        async def _test():
++            obj = await Model2B.objects.aget(field1="A0")
++            assert obj is not None
++            assert obj.__class__ == Model2B
++
++            count = await Model2A.objects.acount()
++            assert count == 40
++
++            exists = await Model2A.objects.aexists()
++            assert exists is True
++
++            first = await Model2A.objects.afirst()
++            assert first is not None
++
++            last = await Model2A.objects.alast()
++            assert last is not None
++
++            updated = await Model2A.objects.filter(pk=1).aupdate(
++                field1="manager_changed"
++            )
++            assert updated == 1
++
++            count_after = await Model2A.objects.filter(field1="manager_changed").acount()
++            assert count_after == 1
++
++        asyncio.run(_test())
++
++    def test_downcasting_consistency(self):
++        """Verify async downcasting behavior is the same as sync."""
++        async def _test():
++            sync_results = list(Model2A.objects.order_by("pk").all())
++            async_results = []
++            async for obj in Model2A.objects.order_by("pk").aiterator():
++                async_results.append(obj)
++
++            assert len(sync_results) == len(async_results)
++            for sync_obj, async_obj in zip(sync_results, async_results):
++                assert sync_obj.__class__ == async_obj.__class__
++                assert sync_obj.pk == async_obj.pk
++
++        asyncio.run(_test())
++
++    def test_union_async(self):
++        """Test async operations on union querysets."""
++        async def _test():
++            qs1 = Model2A.objects.filter(id__lte=10)
++            qs2 = Model2A.objects.filter(id__gt=10)
++            union_qs = qs1.union(qs2)
++            count = await union_qs.acount()
++            assert count == 40
++
++        asyncio.run(_test())
++
++    def test_intersection_async(self):
++        """Test async operations on intersection querysets."""
++        async def _test():
++            qs1 = Model2A.objects.filter(field1__startswith="A")
++            qs2 = Model2A.objects.instance_of(Model2B)
++            intersect_qs = qs1.intersection(qs2)
++            count = await intersect_qs.acount()
++            assert count == 30
++
++        asyncio.run(_test())
++
++    def test_queryset_clone_async(self):
++        """Verify clone preserves polymorphic state for async."""
++        async def _test():
++            qs = Model2A.objects.all().instance_of(Model2B)
++            cloned = qs.all()
++            count = await cloned.acount()
++            assert count == 30
++            assert not cloned.polymorphic_disabled
++
++            non_poly = qs.non_polymorphic()
++            assert non_poly.polymorphic_disabled
++            cloned_non_poly = non_poly.all()
++            assert cloned_non_poly.polymorphic_disabled
++            non_poly_count = await cloned_non_poly.acount()
++            assert non_poly_count == 30
++
++        asyncio.run(_test())
++
++    def test_abulk_create(self):
++        """Test that abulk_create works with polymorphic models."""
++        async def _test():
++            objs = [Model2A(field1=f"bulk{i}") for i in range(10)]
++            result = await Model2A.objects.abulk_create(objs)
++            assert len(result) == 10
++            count = await Model2A.objects.acount()
++            assert count == 50
++
++        asyncio.run(_test())
++
++    def test_adelete(self):
++        """Test that adelete works."""
++        async def _test():
++            deleted = await Model2A.objects.filter(field1="A0").adelete()
++            assert deleted[0] == 4
++
++            remaining = await Model2A.objects.filter(field1="A0").acount()
++            assert remaining == 0
++
++        asyncio.run(_test())
++
++
++class AsyncCrossDBTests(TransactionTestCase):
++    """
++    Test async ORM with cross-database routing.
++    """
++
++    def test_aiterator_cross_db(self):
++        """Test async aiterator with explicit database."""
++        using = "secondary"
++
++        async def _test():
++            count = 0
++            async for obj in (
++                Model2A.objects.using(using).order_by("pk").aiterator()
++            ):
++                count += 1
++            assert count == 0
++
++        asyncio.run(_test())
++
++
++class AsyncPolymorphicPerformanceTests(TransactionTestCase):
++    """
++    Performance tests for async ORM operations.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++
++    def setUp(self):
++        for idx in range(100):
++            Model2A.objects.create(field1=f"A{idx}")
++            Model2B.objects.create(field1=f"A{idx}", field2=f"B{idx}")
++            Model2C.objects.create(field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}")
++            Model2D.objects.create(
++                field1=f"A{idx}", field2=f"B{idx}", field3=f"C{idx}", field4=f"D{idx}"
++            )
++
++    def test_baseline_async_query_count(self):
++        """Test that async iteration uses reasonable number of queries."""
++        async def _test():
++            with self.assertNumQueries(4):
++                results = []
++                async for obj in Model2A.objects.order_by("pk").aiterator():
++                    results.append(obj)
++                assert len(results) == 400
++
++            with self.assertNumQueries(3):
++                results = []
++                async for obj in Model2B.objects.order_by("pk").aiterator():
++                    results.append(obj)
++                assert len(results) == 300
++
++            with self.assertNumQueries(2):
++                results = []
++                async for obj in Model2C.objects.order_by("pk").aiterator():
++                    results.append(obj)
++                assert len(results) == 200
++
++            with self.assertNumQueries(1):
++                results = []
++                async for obj in Model2D.objects.order_by("pk").aiterator():
++                    results.append(obj)
++                assert len(results) == 100
++
++        asyncio.run(_test())
++
++    def test_async_query_count_with_chunking(self):
++        """Test query count with different chunk sizes."""
++        async def _test():
++            with self.assertNumQueries(5):
++                results = []
++                async for obj in Model2A.objects.order_by("pk").aiterator(chunk_size=100):
++                    results.append(obj)
++                assert len(results) == 400
++
++            with self.assertNumQueries(7):
++                results = []
++                async for obj in Model2A.objects.order_by("pk").aiterator(chunk_size=50):
++                    results.append(obj)
++                assert len(results) == 400
++
++        asyncio.run(_test())
+\ No newline at end of file
