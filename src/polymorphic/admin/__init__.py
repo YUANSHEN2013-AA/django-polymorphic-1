@@ -11,7 +11,7 @@ from .childadmin import PolymorphicChildModelAdmin
 from .filters import PolymorphicChildModelFilter
 
 # Utils
-from .forms import PolymorphicModelChoiceForm
+from .forms import PolymorphicModelChoiceForm, PolymorphicTypeSelectForm, PolymorphicTypeSelectWidget
 
 # Expose generic admin features too. There is no need to split those
 # as the admin already relies on contenttypes.
@@ -30,6 +30,8 @@ __all__ = (
     "PolymorphicParentModelAdmin",
     "PolymorphicChildModelAdmin",
     "PolymorphicModelChoiceForm",
+    "PolymorphicTypeSelectForm",
+    "PolymorphicTypeSelectWidget",
     "PolymorphicChildModelFilter",
     "PolymorphicInlineAdminForm",
     "PolymorphicInlineAdminFormSet",

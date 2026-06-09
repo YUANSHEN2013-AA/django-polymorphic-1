@@ -1,0 +1,30 @@
+<div class="polymorphic-type-select" data-type-data-url="{{ widget.type_data_url }}" data-initial-choices="{{ widget.initial_choices }}">
+    <input type="hidden" name="{{ widget.name }}"{% if widget.value %} value="{{ widget.value }}"{% endif %} id="{{ widget.attrs.id }}" data-polymorphic-type-input>
+
+    <div class="polymorphic-type-select__panel">
+        <div class="polymorphic-type-select__header">
+            <h2 class="polymorphic-type-select__title">{% translate "Select Type" %}</h2>
+        </div>
+
+        <div class="polymorphic-type-select__search">
+            <input type="text" class="polymorphic-type-select__search-input" placeholder="{% translate 'Search types...' %}" data-polymorphic-search>
+        </div>
+
+        <div class="polymorphic-type-select__tabs" data-polymorphic-tabs>
+            <button type="button" class="polymorphic-type-select__tab active" data-tab="all">{% translate "All" %}</button>
+            <button type="button" class="polymorphic-type-select__tab" data-tab="favorites">{% translate "Favorites" %}</button>
+            <button type="button" class="polymorphic-type-select__tab" data-tab="recent">{% translate "Recent" %}</button>
+        </div>
+
+        <div class="polymorphic-type-select__categories" data-polymorphic-categories>
+            <div class="polymorphic-type-select__loading">
+                <span class="polymorphic-type-select__spinner"></span>
+                {% translate "Loading types..." %}
+            </div>
+        </div>
+    </div>
+
+    <div class="submit-row polymorphic-type-select__submit">
+        <input type="submit" value="{% translate 'Next' %}" class="default" data-polymorphic-submit disabled>
+    </div>
+</div>

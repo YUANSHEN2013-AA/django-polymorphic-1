@@ -4,6 +4,7 @@ The parent admin displays the list view of the base model.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Generic, cast
 
 from django.contrib import admin
@@ -12,8 +13,10 @@ from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.db import models
-from django.http import Http404, HttpResponseRedirect
+from django.forms import Media
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.template.response import TemplateResponse
+from django.urls import path, re_path
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
 from typing_extensions import TypeVar
@@ -22,7 +25,7 @@ from polymorphic.models import PolymorphicModel
 from polymorphic.query import PolymorphicQuerySet
 from polymorphic.utils import get_base_polymorphic_model
 
-from .forms import PolymorphicModelChoiceForm
+from .forms import PolymorphicModelChoiceForm, PolymorphicTypeSelectForm
 
 _ModelT = TypeVar("_ModelT", bound=PolymorphicModel, default=PolymorphicModel)
 
@@ -66,12 +69,25 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
     polymorphic_list = False
 
     add_type_template = None
-    add_type_form = PolymorphicModelChoiceForm
+    add_type_form = PolymorphicTypeSelectForm
 
     #: The regular expression to filter the primary key in the URL.
     #: This accepts only numbers as defensive measure against catch-all URLs.
     #: If your primary key consists of string values, update this regular expression.
     pk_regex = r"(\d+|__fk__)"
+
+    #: Whether to use the enhanced type selection (search, favorites, recent, categories)
+    use_enhanced_type_select = True
+
+    #: Extra media for the enhanced type selection widget
+    polymorphic_media: Media = Media(
+        js=(
+            "polymorphic/js/polymorphic_type_select.js",
+        ),
+        css={
+            "all": ("polymorphic/css/polymorphic_type_select.css",),
+        },
+    )
 
     def __init__(self, model: type[_ModelT], admin_site: Any, *args: Any, **kwargs: Any) -> None:
         super().__init__(model, admin_site, *args, **kwargs)
@@ -80,15 +96,21 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         if self.base_model is None:
             self.base_model = get_base_polymorphic_model(model)
 
+    @property
+    def media(self):
+        base_media = super().media
+        if self.use_enhanced_type_select:
+            from django.forms import Media as MediaCls
+
+            return base_media + self.polymorphic_media
+        return base_media
+
     def _lazy_setup(self):
         if self._is_setup:
             return
 
         self._child_models = self.get_child_models()
 
-        # Make absolutely sure that the child models don't use the old 0.9 format,
-        # as of polymorphic 1.4 this deprecated configuration is no longer supported.
-        # Instead, register the child models in the admin too.
         if self._child_models and not issubclass(self._child_models[0], models.Model):
             raise ImproperlyConfigured(
                 "Since django-polymorphic 1.4, the `child_models` attribute "
@@ -131,6 +153,63 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             choices.append((ct.id, model._meta.verbose_name))
         return choices
 
+    def get_child_type_categories(self, request, action):
+        """
+        Return a dictionary grouping child types by category.
+        Override this to customize the category grouping.
+
+        Default categories are based on app_label.
+        Returns a dict with category name as key and list of type dicts as value.
+        """
+        self._lazy_setup()
+        content_types = ContentType.objects.get_for_models(
+            *self.get_child_models(), for_concrete_models=False
+        )
+
+        categories: dict[str, list[dict]] = {}
+
+        for model, ct in content_types.items():
+            perm_function_name = f"has_{action}_permission"
+            model_admin = self._get_real_admin_by_model(model)
+            perm_function = getattr(model_admin, perm_function_name)
+            if not perm_function(request):
+                continue
+
+            app_label = model._meta.app_label
+            category_name = str(model._meta.app_config.verbose_name) if model._meta.app_config else app_label
+
+            if category_name not in categories:
+                categories[category_name] = []
+
+            categories[category_name].append(
+                {
+                    "id": ct.id,
+                    "name": str(model._meta.verbose_name),
+                    "model_name": model._meta.model_name,
+                    "app_label": app_label,
+                    "docstring": (model.__doc__ or "").strip().split("\n")[0] if model.__doc__ else "",
+                }
+            )
+
+        return categories
+
+    def add_type_data_view(self, request):
+        """
+        API endpoint that returns child type data as JSON for async loading.
+        """
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+
+        categories = self.get_child_type_categories(request, "add")
+
+        data = {
+            "categories": [
+                {"name": name, "types": types} for name, types in categories.items()
+            ]
+        }
+
+        return JsonResponse(data)
+
     def _get_real_admin(self, object_id, super_if_self=True):
         try:
             obj = (
@@ -144,27 +223,22 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         try:
             ct = ContentType.objects.get_for_id(ct_id)
         except ContentType.DoesNotExist as e:
-            raise Http404(e)  # Handle invalid GET parameters
+            raise Http404(e)
 
         model_class = ct.model_class()
         if not model_class:
-            # Handle model deletion
             app_label, model = ct.natural_key()
             raise Http404(f"No model found for '{app_label}.{model}'.")
 
         return self._get_real_admin_by_model(model_class, super_if_self=super_if_self)
 
     def _get_real_admin_by_model(self, model_class, super_if_self=True):
-        # In case of a ?ct_id=### parameter, the view is already checked for permissions.
-        # Hence, make sure this is a derived object, or risk exposing other admin interfaces.
         if model_class not in self._child_models:
             raise PermissionDenied(
                 f"Invalid model '{model_class}', it must be registered as child model."
             )
 
         try:
-            # HACK: the only way to get the instance of an model admin,
-            # is to read the registry of the AdminSite.
             real_admin = self._child_admin_site._registry[model_class]
         except KeyError:
             raise ChildAdminNotRegistered(
@@ -177,7 +251,6 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             return real_admin
 
     def get_queryset(self, request):
-        # optimize the list display.
         qs = cast(PolymorphicQuerySet, super().get_queryset(request))
         if not self.polymorphic_list:
             qs = qs.non_polymorphic()
@@ -187,13 +260,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         """Redirect the add view to the real admin."""
         ct_id = int(request.GET.get("ct_id", 0))
         if not ct_id:
-            # Display choices
             return self.add_type_view(request)
         else:
             real_admin = self._get_real_admin_by_ct(ct_id)
-            # rebuild form_url, otherwise libraries below will override it.
-            # Preserve popup-related parameters to ensure popup functionality works
-            # correctly even after validation errors (issue #612)
             form_url = add_preserved_filters(
                 {
                     "preserved_filters": request.GET.urlencode(),
@@ -209,14 +278,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         return real_admin.change_view(request, object_id, *args, **kwargs)
 
     def changeform_view(self, request, object_id=None, *args, **kwargs):
-        # The `changeform_view` is available as of Django 1.7, combining the add_view and change_view.
-        # As it's directly called by django-reversion, this method is also overwritten to make sure it
-        # also redirects to the child admin.
         if object_id:
             real_admin = self._get_real_admin(object_id)
             return real_admin.changeform_view(request, object_id, *args, **kwargs)
         else:
-            # Add view. As it should already be handled via `add_view`, this means something custom is done here!
             return super().changeform_view(request, object_id, *args, **kwargs)
 
     def history_view(self, request, object_id, extra_context=None):
@@ -235,10 +300,19 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         """
         urls = super().get_urls()
 
-        # At this point. all admin code needs to be known.
         self._lazy_setup()
 
-        return urls
+        info = self.model._meta.app_label, self.model._meta.model_name
+
+        custom_urls = [
+            path(
+                "add-type-data/",
+                self.admin_site.admin_view(self.add_type_data_view),
+                name=f"{info[1]}_add_type_data",
+            ),
+        ]
+
+        return custom_urls + urls
 
     def add_type_view(self, request, form_url=""):
         """
@@ -249,30 +323,35 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
 
         extra_qs = ""
         if request.META["QUERY_STRING"]:
-            # QUERY_STRING is bytes in Python 3, using force_str() to decode it as string.
-            # See QueryDict how Django deals with that.
-            # TODO: should this use a Django method instead of manipulating the string directly?
             extra_qs = f"&{force_str(request.META['QUERY_STRING'])}"
 
+        if self.use_enhanced_type_select:
+            return self._add_type_view_enhanced(request, form_url, extra_qs)
+        else:
+            return self._add_type_view_classic(request, form_url, extra_qs)
+
+    def _add_type_view_enhanced(self, request, form_url, extra_qs):
+        """
+        Display the enhanced type selection interface.
+        """
         choices = self.get_child_type_choices(request, "add")
         if len(choices) == 0:
             raise PermissionDenied
-        if len(choices) == 1:
-            return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
 
-        # Create form
+        type_data_url = request.path_info.rstrip("/") + "/add-type-data/"
+
         form = self.add_type_form(
             data=request.POST if request.method == "POST" else None,
-            initial={"ct_id": choices[0][0]},
+            type_data_url=type_data_url,
+            choices=choices,
         )
-        setattr(form.fields["ct_id"], "choices", choices)
 
         if form.is_valid():
-            return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+            ct_id = int(form.cleaned_data["ct_id"])
+            return HttpResponseRedirect(f"?ct_id={ct_id}{extra_qs}")
 
-        # Wrap in all admin layout
         fieldsets = ((None, {"fields": ("ct_id",)}),)
-        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)  # type: ignore[arg-type]
+        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)
         media = self.media + adminForm.media
         opts = self.model._meta
 
@@ -281,7 +360,43 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             "adminform": adminForm,
             "is_popup": ("_popup" in request.POST or "_popup" in request.GET),
             "media": media,
-            "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
+            "errors": AdminErrorList(form, ()),
+            "app_label": opts.app_label,
+            "type_data_url": type_data_url,
+            "initial_choices": json.dumps(choices),
+        }
+        return self.render_add_type_form(request, context, form_url)
+
+    def _add_type_view_classic(self, request, form_url, extra_qs):
+        """
+        Display the classic radio-button type selection interface.
+        """
+        choices = self.get_child_type_choices(request, "add")
+        if len(choices) == 0:
+            raise PermissionDenied
+        if len(choices) == 1:
+            return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
+
+        form = PolymorphicModelChoiceForm(
+            data=request.POST if request.method == "POST" else None,
+            initial={"ct_id": choices[0][0]},
+        )
+        setattr(form.fields["ct_id"], "choices", choices)
+
+        if form.is_valid():
+            return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+
+        fieldsets = ((None, {"fields": ("ct_id",)}),)
+        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)
+        media = self.media + adminForm.media
+        opts = self.model._meta
+
+        context = {
+            "title": _("Add %s") % force_str(opts.verbose_name),
+            "adminform": adminForm,
+            "is_popup": ("_popup" in request.POST or "_popup" in request.GET),
+            "media": media,
+            "errors": AdminErrorList(form, ()),
             "app_label": opts.app_label,
         }
         return self.render_add_type_form(request, context, form_url)
@@ -304,9 +419,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         )
 
         templates = self.add_type_template or [
-            f"admin/{app_label}/{opts.object_name.lower()}/add_type_form.html",  # type: ignore[union-attr]
+            f"admin/{app_label}/{opts.object_name.lower()}/add_type_form.html",
             f"admin/{app_label}/add_type_form.html",
-            "admin/polymorphic/add_type_form.html",  # added default here
+            "admin/polymorphic/add_type_form.html",
             "admin/add_type_form.html",
         ]
 
@@ -314,20 +429,18 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         return self.admin_site.admin_view(TemplateResponse)(request, templates, context)
 
     @property
-    def change_list_template(self) -> list[str]:  # type: ignore[override]
+    def change_list_template(self) -> list[str]:
         opts = self.model._meta
         app_label = opts.app_label
 
-        # Pass the base options
         assert self.base_model is not None, "base_model must be set"
         base_opts = self.base_model._meta
         base_app_label = base_opts.app_label
 
         return [
-            f"admin/{app_label}/{opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
+            f"admin/{app_label}/{opts.object_name.lower()}/change_list.html",
             f"admin/{app_label}/change_list.html",
-            # Added base class:
-            f"admin/{base_app_label}/{base_opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
+            f"admin/{base_app_label}/{base_opts.object_name.lower()}/change_list.html",
             f"admin/{base_app_label}/change_list.html",
             "admin/change_list.html",
         ]
