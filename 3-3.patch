@@ -1,0 +1,1071 @@
+diff --git a/src/polymorphic/admin/__init__.py b/src/polymorphic/admin/__init__.py
+index 48933f1..5fa2c54 100644
+--- a/src/polymorphic/admin/__init__.py
++++ b/src/polymorphic/admin/__init__.py
+@@ -11,7 +11,7 @@ from .childadmin import PolymorphicChildModelAdmin
+ from .filters import PolymorphicChildModelFilter
+ 
+ # Utils
+-from .forms import PolymorphicModelChoiceForm
++from .forms import PolymorphicModelChoiceForm, PolymorphicTypeSelectForm, PolymorphicTypeSelectWidget
+ 
+ # Expose generic admin features too. There is no need to split those
+ # as the admin already relies on contenttypes.
+@@ -30,6 +30,8 @@ __all__ = (
+     "PolymorphicParentModelAdmin",
+     "PolymorphicChildModelAdmin",
+     "PolymorphicModelChoiceForm",
++    "PolymorphicTypeSelectForm",
++    "PolymorphicTypeSelectWidget",
+     "PolymorphicChildModelFilter",
+     "PolymorphicInlineAdminForm",
+     "PolymorphicInlineAdminFormSet",
+@@ -38,4 +40,4 @@ __all__ = (
+     "StackedPolymorphicInline",
+     "GenericPolymorphicInlineModelAdmin",
+     "GenericStackedPolymorphicInline",
+-)
++)
+\ No newline at end of file
+diff --git a/src/polymorphic/admin/forms.py b/src/polymorphic/admin/forms.py
+index d3c359c..e3d9678 100644
+--- a/src/polymorphic/admin/forms.py
++++ b/src/polymorphic/admin/forms.py
+@@ -1,7 +1,12 @@
++from __future__ import annotations
++
++import json
+ from typing import Any
+ 
+ from django import forms
++from django.conf import settings
+ from django.contrib.admin.widgets import AdminRadioSelect
++from django.forms import Media
+ from django.utils.translation import gettext_lazy as _
+ 
+ 
+@@ -10,7 +15,6 @@ class PolymorphicModelChoiceForm(forms.Form):
+     The default form for the ``add_type_form``. Can be overwritten and replaced.
+     """
+ 
+-    #: Define the label for the radiofield
+     type_label = _("Type")
+ 
+     ct_id = forms.ChoiceField(
+@@ -18,6 +22,66 @@ class PolymorphicModelChoiceForm(forms.Form):
+     )
+ 
+     def __init__(self, *args: Any, **kwargs: Any) -> None:
+-        # Allow to easily redefine the label (a commonly expected usecase)
+         super().__init__(*args, **kwargs)
+         self.fields["ct_id"].label = self.type_label
++
++
++class PolymorphicTypeSelectWidget(forms.Widget):
++    """
++    A widget that renders an enhanced type selection interface with:
++    - Search/filter
++    - Favorites (localStorage)
++    - Recently used (localStorage)
++    - Categorized display
++    - Async loading of subclass list
++    """
++
++    template_name = "admin/polymorphic/widgets/type_select.html"
++    input_type = "hidden"
++
++    class Media:
++        js = (
++            "polymorphic/js/polymorphic_type_select.js",
++        )
++        css = {
++            "all": ("polymorphic/css/polymorphic_type_select.css",),
++        }
++
++    def __init__(self, attrs=None, type_data_url: str = "", choices=None):
++        super().__init__(attrs)
++        self.type_data_url = type_data_url
++        self.choices = choices or []
++
++    def get_context(self, name, value, attrs):
++        context = super().get_context(name, value, attrs)
++        context["widget"]["type"] = self.input_type
++        context["widget"]["type_data_url"] = self.type_data_url
++        context["widget"]["initial_choices"] = json.dumps(self.choices)
++        return context
++
++    def value_from_datadict(self, data, files, name):
++        return data.get(name)
++
++
++class PolymorphicTypeSelectForm(forms.Form):
++    """
++    Enhanced form for the polymorphic add type view.
++    Uses PolymorphicTypeSelectWidget for a rich type selection experience.
++    """
++
++    type_label = _("Type")
++
++    ct_id = forms.CharField(
++        label=type_label,
++        widget=PolymorphicTypeSelectWidget,
++    )
++
++    def __init__(
++        self, *args: Any, type_data_url: str = "", choices: list | None = None, **kwargs: Any
++    ) -> None:
++        super().__init__(*args, **kwargs)
++        self.fields["ct_id"].label = self.type_label
++        if type_data_url:
++            self.fields["ct_id"].widget.type_data_url = type_data_url
++        if choices:
++            self.fields["ct_id"].widget.choices = choices
+\ No newline at end of file
+diff --git a/src/polymorphic/admin/parentadmin.py b/src/polymorphic/admin/parentadmin.py
+index ebb725b..3e4f180 100644
+--- a/src/polymorphic/admin/parentadmin.py
++++ b/src/polymorphic/admin/parentadmin.py
+@@ -4,6 +4,7 @@ The parent admin displays the list view of the base model.
+ 
+ from __future__ import annotations
+ 
++import json
+ from typing import TYPE_CHECKING, Any, Generic, cast
+ 
+ from django.contrib import admin
+@@ -12,8 +13,10 @@ from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
+ from django.contrib.contenttypes.models import ContentType
+ from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+ from django.db import models
+-from django.http import Http404, HttpResponseRedirect
++from django.forms import Media
++from django.http import Http404, HttpResponseRedirect, JsonResponse
+ from django.template.response import TemplateResponse
++from django.urls import path, re_path
+ from django.utils.encoding import force_str
+ from django.utils.translation import gettext_lazy as _
+ from typing_extensions import TypeVar
+@@ -22,7 +25,7 @@ from polymorphic.models import PolymorphicModel
+ from polymorphic.query import PolymorphicQuerySet
+ from polymorphic.utils import get_base_polymorphic_model
+ 
+-from .forms import PolymorphicModelChoiceForm
++from .forms import PolymorphicModelChoiceForm, PolymorphicTypeSelectForm
+ 
+ _ModelT = TypeVar("_ModelT", bound=PolymorphicModel, default=PolymorphicModel)
+ 
+@@ -66,13 +69,26 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+     polymorphic_list = False
+ 
+     add_type_template = None
+-    add_type_form = PolymorphicModelChoiceForm
++    add_type_form = PolymorphicTypeSelectForm
+ 
+     #: The regular expression to filter the primary key in the URL.
+     #: This accepts only numbers as defensive measure against catch-all URLs.
+     #: If your primary key consists of string values, update this regular expression.
+     pk_regex = r"(\d+|__fk__)"
+ 
++    #: Whether to use the enhanced type selection (search, favorites, recent, categories)
++    use_enhanced_type_select = True
++
++    #: Extra media for the enhanced type selection widget
++    polymorphic_media: Media = Media(
++        js=(
++            "polymorphic/js/polymorphic_type_select.js",
++        ),
++        css={
++            "all": ("polymorphic/css/polymorphic_type_select.css",),
++        },
++    )
++
+     def __init__(self, model: type[_ModelT], admin_site: Any, *args: Any, **kwargs: Any) -> None:
+         super().__init__(model, admin_site, *args, **kwargs)
+         self._is_setup = False
+@@ -80,15 +96,21 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         if self.base_model is None:
+             self.base_model = get_base_polymorphic_model(model)
+ 
++    @property
++    def media(self):
++        base_media = super().media
++        if self.use_enhanced_type_select:
++            from django.forms import Media as MediaCls
++
++            return base_media + self.polymorphic_media
++        return base_media
++
+     def _lazy_setup(self):
+         if self._is_setup:
+             return
+ 
+         self._child_models = self.get_child_models()
+ 
+-        # Make absolutely sure that the child models don't use the old 0.9 format,
+-        # as of polymorphic 1.4 this deprecated configuration is no longer supported.
+-        # Instead, register the child models in the admin too.
+         if self._child_models and not issubclass(self._child_models[0], models.Model):
+             raise ImproperlyConfigured(
+                 "Since django-polymorphic 1.4, the `child_models` attribute "
+@@ -131,6 +153,63 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             choices.append((ct.id, model._meta.verbose_name))
+         return choices
+ 
++    def get_child_type_categories(self, request, action):
++        """
++        Return a dictionary grouping child types by category.
++        Override this to customize the category grouping.
++
++        Default categories are based on app_label.
++        Returns a dict with category name as key and list of type dicts as value.
++        """
++        self._lazy_setup()
++        content_types = ContentType.objects.get_for_models(
++            *self.get_child_models(), for_concrete_models=False
++        )
++
++        categories: dict[str, list[dict]] = {}
++
++        for model, ct in content_types.items():
++            perm_function_name = f"has_{action}_permission"
++            model_admin = self._get_real_admin_by_model(model)
++            perm_function = getattr(model_admin, perm_function_name)
++            if not perm_function(request):
++                continue
++
++            app_label = model._meta.app_label
++            category_name = str(model._meta.app_config.verbose_name) if model._meta.app_config else app_label
++
++            if category_name not in categories:
++                categories[category_name] = []
++
++            categories[category_name].append(
++                {
++                    "id": ct.id,
++                    "name": str(model._meta.verbose_name),
++                    "model_name": model._meta.model_name,
++                    "app_label": app_label,
++                    "docstring": (model.__doc__ or "").strip().split("\n")[0] if model.__doc__ else "",
++                }
++            )
++
++        return categories
++
++    def add_type_data_view(self, request):
++        """
++        API endpoint that returns child type data as JSON for async loading.
++        """
++        if not self.has_add_permission(request):
++            raise PermissionDenied
++
++        categories = self.get_child_type_categories(request, "add")
++
++        data = {
++            "categories": [
++                {"name": name, "types": types} for name, types in categories.items()
++            ]
++        }
++
++        return JsonResponse(data)
++
+     def _get_real_admin(self, object_id, super_if_self=True):
+         try:
+             obj = (
+@@ -144,27 +223,22 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         try:
+             ct = ContentType.objects.get_for_id(ct_id)
+         except ContentType.DoesNotExist as e:
+-            raise Http404(e)  # Handle invalid GET parameters
++            raise Http404(e)
+ 
+         model_class = ct.model_class()
+         if not model_class:
+-            # Handle model deletion
+             app_label, model = ct.natural_key()
+             raise Http404(f"No model found for '{app_label}.{model}'.")
+ 
+         return self._get_real_admin_by_model(model_class, super_if_self=super_if_self)
+ 
+     def _get_real_admin_by_model(self, model_class, super_if_self=True):
+-        # In case of a ?ct_id=### parameter, the view is already checked for permissions.
+-        # Hence, make sure this is a derived object, or risk exposing other admin interfaces.
+         if model_class not in self._child_models:
+             raise PermissionDenied(
+                 f"Invalid model '{model_class}', it must be registered as child model."
+             )
+ 
+         try:
+-            # HACK: the only way to get the instance of an model admin,
+-            # is to read the registry of the AdminSite.
+             real_admin = self._child_admin_site._registry[model_class]
+         except KeyError:
+             raise ChildAdminNotRegistered(
+@@ -177,7 +251,6 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             return real_admin
+ 
+     def get_queryset(self, request):
+-        # optimize the list display.
+         qs = cast(PolymorphicQuerySet, super().get_queryset(request))
+         if not self.polymorphic_list:
+             qs = qs.non_polymorphic()
+@@ -187,13 +260,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         """Redirect the add view to the real admin."""
+         ct_id = int(request.GET.get("ct_id", 0))
+         if not ct_id:
+-            # Display choices
+             return self.add_type_view(request)
+         else:
+             real_admin = self._get_real_admin_by_ct(ct_id)
+-            # rebuild form_url, otherwise libraries below will override it.
+-            # Preserve popup-related parameters to ensure popup functionality works
+-            # correctly even after validation errors (issue #612)
+             form_url = add_preserved_filters(
+                 {
+                     "preserved_filters": request.GET.urlencode(),
+@@ -209,14 +278,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         return real_admin.change_view(request, object_id, *args, **kwargs)
+ 
+     def changeform_view(self, request, object_id=None, *args, **kwargs):
+-        # The `changeform_view` is available as of Django 1.7, combining the add_view and change_view.
+-        # As it's directly called by django-reversion, this method is also overwritten to make sure it
+-        # also redirects to the child admin.
+         if object_id:
+             real_admin = self._get_real_admin(object_id)
+             return real_admin.changeform_view(request, object_id, *args, **kwargs)
+         else:
+-            # Add view. As it should already be handled via `add_view`, this means something custom is done here!
+             return super().changeform_view(request, object_id, *args, **kwargs)
+ 
+     def history_view(self, request, object_id, extra_context=None):
+@@ -235,10 +300,19 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         """
+         urls = super().get_urls()
+ 
+-        # At this point. all admin code needs to be known.
+         self._lazy_setup()
+ 
+-        return urls
++        info = self.model._meta.app_label, self.model._meta.model_name
++
++        custom_urls = [
++            path(
++                "add-type-data/",
++                self.admin_site.admin_view(self.add_type_data_view),
++                name=f"{info[1]}_add_type_data",
++            ),
++        ]
++
++        return custom_urls + urls
+ 
+     def add_type_view(self, request, form_url=""):
+         """
+@@ -249,19 +323,61 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+ 
+         extra_qs = ""
+         if request.META["QUERY_STRING"]:
+-            # QUERY_STRING is bytes in Python 3, using force_str() to decode it as string.
+-            # See QueryDict how Django deals with that.
+-            # TODO: should this use a Django method instead of manipulating the string directly?
+             extra_qs = f"&{force_str(request.META['QUERY_STRING'])}"
+ 
++        if self.use_enhanced_type_select:
++            return self._add_type_view_enhanced(request, form_url, extra_qs)
++        else:
++            return self._add_type_view_classic(request, form_url, extra_qs)
++
++    def _add_type_view_enhanced(self, request, form_url, extra_qs):
++        """
++        Display the enhanced type selection interface.
++        """
++        choices = self.get_child_type_choices(request, "add")
++        if len(choices) == 0:
++            raise PermissionDenied
++
++        type_data_url = request.path_info.rstrip("/") + "/add-type-data/"
++
++        form = self.add_type_form(
++            data=request.POST if request.method == "POST" else None,
++            type_data_url=type_data_url,
++            choices=choices,
++        )
++
++        if form.is_valid():
++            ct_id = int(form.cleaned_data["ct_id"])
++            return HttpResponseRedirect(f"?ct_id={ct_id}{extra_qs}")
++
++        fieldsets = ((None, {"fields": ("ct_id",)}),)
++        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)
++        media = self.media + adminForm.media
++        opts = self.model._meta
++
++        context = {
++            "title": _("Add %s") % force_str(opts.verbose_name),
++            "adminform": adminForm,
++            "is_popup": ("_popup" in request.POST or "_popup" in request.GET),
++            "media": media,
++            "errors": AdminErrorList(form, ()),
++            "app_label": opts.app_label,
++            "type_data_url": type_data_url,
++            "initial_choices": json.dumps(choices),
++        }
++        return self.render_add_type_form(request, context, form_url)
++
++    def _add_type_view_classic(self, request, form_url, extra_qs):
++        """
++        Display the classic radio-button type selection interface.
++        """
+         choices = self.get_child_type_choices(request, "add")
+         if len(choices) == 0:
+             raise PermissionDenied
+         if len(choices) == 1:
+             return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
+ 
+-        # Create form
+-        form = self.add_type_form(
++        form = PolymorphicModelChoiceForm(
+             data=request.POST if request.method == "POST" else None,
+             initial={"ct_id": choices[0][0]},
+         )
+@@ -270,9 +386,8 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         if form.is_valid():
+             return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+ 
+-        # Wrap in all admin layout
+         fieldsets = ((None, {"fields": ("ct_id",)}),)
+-        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)  # type: ignore[arg-type]
++        adminForm = AdminForm(form, fieldsets, {}, model_admin=self)
+         media = self.media + adminForm.media
+         opts = self.model._meta
+ 
+@@ -281,7 +396,7 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+             "adminform": adminForm,
+             "is_popup": ("_popup" in request.POST or "_popup" in request.GET),
+             "media": media,
+-            "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
++            "errors": AdminErrorList(form, ()),
+             "app_label": opts.app_label,
+         }
+         return self.render_add_type_form(request, context, form_url)
+@@ -304,9 +419,9 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         )
+ 
+         templates = self.add_type_template or [
+-            f"admin/{app_label}/{opts.object_name.lower()}/add_type_form.html",  # type: ignore[union-attr]
++            f"admin/{app_label}/{opts.object_name.lower()}/add_type_form.html",
+             f"admin/{app_label}/add_type_form.html",
+-            "admin/polymorphic/add_type_form.html",  # added default here
++            "admin/polymorphic/add_type_form.html",
+             "admin/add_type_form.html",
+         ]
+ 
+@@ -314,20 +429,18 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
+         return self.admin_site.admin_view(TemplateResponse)(request, templates, context)
+ 
+     @property
+-    def change_list_template(self) -> list[str]:  # type: ignore[override]
++    def change_list_template(self) -> list[str]:
+         opts = self.model._meta
+         app_label = opts.app_label
+ 
+-        # Pass the base options
+         assert self.base_model is not None, "base_model must be set"
+         base_opts = self.base_model._meta
+         base_app_label = base_opts.app_label
+ 
+         return [
+-            f"admin/{app_label}/{opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
++            f"admin/{app_label}/{opts.object_name.lower()}/change_list.html",
+             f"admin/{app_label}/change_list.html",
+-            # Added base class:
+-            f"admin/{base_app_label}/{base_opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
++            f"admin/{base_app_label}/{base_opts.object_name.lower()}/change_list.html",
+             f"admin/{base_app_label}/change_list.html",
+             "admin/change_list.html",
+-        ]
++        ]
+\ No newline at end of file
+diff --git a/src/polymorphic/static/polymorphic/css/polymorphic_type_select.css b/src/polymorphic/static/polymorphic/css/polymorphic_type_select.css
+new file mode 100644
+index 0000000..976c61e
+--- /dev/null
++++ b/src/polymorphic/static/polymorphic/css/polymorphic_type_select.css
+@@ -0,0 +1,238 @@
++.polymorphic-type-select {
++    padding: 10px 0;
++}
++
++.polymorphic-type-select__panel {
++    background: var(--body-bg, #fff);
++    border: 1px solid var(--border-color, #ccc);
++    border-radius: 4px;
++    overflow: hidden;
++}
++
++.polymorphic-type-select__header {
++    padding: 12px 16px;
++    border-bottom: 1px solid var(--border-color, #ccc);
++    background: var(--darkened-bg, #f8f8f8);
++}
++
++.polymorphic-type-select__title {
++    margin: 0;
++    font-size: 14px;
++    font-weight: 600;
++    color: var(--body-fg, #333);
++}
++
++.polymorphic-type-select__search {
++    padding: 12px 16px;
++    border-bottom: 1px solid var(--border-color, #ccc);
++}
++
++.polymorphic-type-select__search-input {
++    width: 100%;
++    padding: 8px 12px;
++    border: 1px solid var(--border-color, #ccc);
++    border-radius: 4px;
++    font-size: 13px;
++    box-sizing: border-box;
++    background: var(--body-bg, #fff);
++    color: var(--body-fg, #333);
++}
++
++.polymorphic-type-select__search-input:focus {
++    border-color: var(--primary, #79aec8);
++    outline: none;
++    box-shadow: 0 0 0 2px rgba(121, 174, 200, 0.25);
++}
++
++.polymorphic-type-select__tabs {
++    display: flex;
++    border-bottom: 1px solid var(--border-color, #ccc);
++    padding: 0 12px;
++    background: var(--darkened-bg, #f8f8f8);
++}
++
++.polymorphic-type-select__tab {
++    padding: 8px 16px;
++    border: none;
++    background: none;
++    cursor: pointer;
++    font-size: 12px;
++    font-weight: 500;
++    color: var(--body-quiet-color, #666);
++    border-bottom: 2px solid transparent;
++    transition: color 0.15s, border-color 0.15s;
++}
++
++.polymorphic-type-select__tab:hover {
++    color: var(--body-fg, #333);
++}
++
++.polymorphic-type-select__tab.active {
++    color: var(--primary, #79aec8);
++    border-bottom-color: var(--primary, #79aec8);
++}
++
++.polymorphic-type-select__categories {
++    max-height: 380px;
++    overflow-y: auto;
++    padding: 8px 16px;
++}
++
++.polymorphic-type-select__loading {
++    padding: 24px;
++    text-align: center;
++    color: var(--body-quiet-color, #666);
++    font-size: 13px;
++}
++
++.polymorphic-type-select__spinner {
++    display: inline-block;
++    width: 16px;
++    height: 16px;
++    border: 2px solid var(--border-color, #ccc);
++    border-top-color: var(--primary, #79aec8);
++    border-radius: 50%;
++    animation: polymorphic-spin 0.6s linear infinite;
++    margin-right: 8px;
++    vertical-align: middle;
++}
++
++@keyframes polymorphic-spin {
++    to { transform: rotate(360deg); }
++}
++
++.polymorphic-type-select__empty,
++.polymorphic-type-select__error {
++    padding: 32px 16px;
++    text-align: center;
++    color: var(--body-quiet-color, #666);
++    font-size: 13px;
++}
++
++.polymorphic-type-select__error {
++    color: var(--error-fg, #ba2121);
++}
++
++.polymorphic-type-select__category {
++    margin-bottom: 8px;
++}
++
++.polymorphic-type-select__category-name {
++    font-size: 11px;
++    font-weight: 600;
++    text-transform: uppercase;
++    letter-spacing: 0.5px;
++    color: var(--body-quiet-color, #999);
++    margin: 12px 0 4px 0;
++    padding: 0;
++}
++
++.polymorphic-type-select__type-list {
++    display: flex;
++    flex-direction: column;
++    gap: 2px;
++}
++
++.polymorphic-type-select__type-item {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    padding: 8px 12px;
++    border: 1px solid transparent;
++    border-radius: 4px;
++    cursor: pointer;
++    transition: background 0.15s, border-color 0.15s;
++}
++
++.polymorphic-type-select__type-item:hover {
++    background: var(--selected-row, #f2f9fc);
++    border-color: var(--primary, #79aec8);
++}
++
++.polymorphic-type-select__type-item.is-selected {
++    background: var(--selected-bg, #e4f0f5);
++    border-color: var(--primary, #79aec8);
++    font-weight: 500;
++}
++
++.polymorphic-type-select__type-info {
++    display: flex;
++    flex-direction: column;
++    gap: 2px;
++    flex: 1;
++    min-width: 0;
++}
++
++.polymorphic-type-select__type-name {
++    font-size: 13px;
++    color: var(--body-fg, #333);
++}
++
++.polymorphic-type-select__type-desc {
++    font-size: 11px;
++    color: var(--body-quiet-color, #999);
++    white-space: nowrap;
++    overflow: hidden;
++    text-overflow: ellipsis;
++}
++
++.polymorphic-type-select__fav-btn {
++    flex-shrink: 0;
++    margin-left: 8px;
++    padding: 2px 6px;
++    border: none;
++    background: none;
++    cursor: pointer;
++    font-size: 14px;
++    color: var(--body-quiet-color, #ccc);
++    transition: color 0.15s;
++}
++
++.polymorphic-type-select__fav-btn:hover {
++    color: #e8b830;
++}
++
++.polymorphic-type-select__type-item.is-favorite .polymorphic-type-select__fav-btn {
++    color: #e8b830;
++}
++
++.polymorphic-type-select__submit {
++    margin-top: 12px;
++    padding: 0 !important;
++    background: none !important;
++    border: none !important;
++}
++
++.polymorphic-type-select__submit input[type="submit"]:disabled {
++    opacity: 0.5;
++    cursor: not-allowed;
++}
++
++@media (prefers-color-scheme: dark) {
++    .polymorphic-type-select__panel {
++        background: var(--body-bg, #121212);
++        border-color: var(--border-color, #2b2b2b);
++    }
++
++    .polymorphic-type-select__header {
++        background: var(--darkened-bg, #1e1e1e);
++        border-color: var(--border-color, #2b2b2b);
++    }
++
++    .polymorphic-type-select__search {
++        border-color: var(--border-color, #2b2b2b);
++    }
++
++    .polymorphic-type-select__tabs {
++        background: var(--darkened-bg, #1e1e1e);
++        border-color: var(--border-color, #2b2b2b);
++    }
++
++    .polymorphic-type-select__type-item:hover {
++        background: var(--selected-row, #1a3a4a);
++    }
++
++    .polymorphic-type-select__type-item.is-selected {
++        background: var(--selected-bg, #1a3a4a);
++    }
++}
+\ No newline at end of file
+diff --git a/src/polymorphic/static/polymorphic/js/polymorphic_type_select.js b/src/polymorphic/static/polymorphic/js/polymorphic_type_select.js
+new file mode 100644
+index 0000000..9de7335
+--- /dev/null
++++ b/src/polymorphic/static/polymorphic/js/polymorphic_type_select.js
+@@ -0,0 +1,268 @@
++(function() {
++    'use strict';
++
++    var STORAGE_KEY_FAVORITES = 'polymorphic_type_select_favorites';
++    var STORAGE_KEY_RECENT = 'polymorphic_type_select_recent';
++    var MAX_RECENT_ITEMS = 10;
++
++    function getFavorites() {
++        try {
++            return JSON.parse(localStorage.getItem(STORAGE_KEY_FAVORITES) || '[]');
++        } catch (e) {
++            return [];
++        }
++    }
++
++    function setFavorites(favorites) {
++        localStorage.setItem(STORAGE_KEY_FAVORITES, JSON.stringify(favorites));
++    }
++
++    function getRecent() {
++        try {
++            return JSON.parse(localStorage.getItem(STORAGE_KEY_RECENT) || '[]');
++        } catch (e) {
++            return [];
++        }
++    }
++
++    function setRecent(recent) {
++        localStorage.setItem(STORAGE_KEY_RECENT, JSON.stringify(recent));
++    }
++
++    function addRecent(id) {
++        var recent = getRecent();
++        recent = recent.filter(function(item) { return item !== id; });
++        recent.unshift(id);
++        if (recent.length > MAX_RECENT_ITEMS) {
++            recent = recent.slice(0, MAX_RECENT_ITEMS);
++        }
++        setRecent(recent);
++    }
++
++    function toggleFavorite(id) {
++        var favorites = getFavorites();
++        var index = favorites.indexOf(id);
++        if (index === -1) {
++            favorites.push(id);
++        } else {
++            favorites.splice(index, 1);
++        }
++        setFavorites(favorites);
++        return index === -1;
++    }
++
++    function isFavorite(id) {
++        return getFavorites().indexOf(id) !== -1;
++    }
++
++    function initWidget(container) {
++        var hiddenInput = container.querySelector('[data-polymorphic-type-input]');
++        var searchInput = container.querySelector('[data-polymorphic-search]');
++        var tabsContainer = container.querySelector('[data-polymorphic-tabs]');
++        var categoriesContainer = container.querySelector('[data-polymorphic-categories]');
++        var submitButton = container.querySelector('[data-polymorphic-submit]');
++        var typeDataUrl = container.getAttribute('data-type-data-url');
++        var selectedTypeId = null;
++        var allCategories = [];
++        var loadingEl = container.querySelector('.polymorphic-type-select__loading');
++
++        function renderCategories(categories, filter, tab) {
++            var searchTerm = (filter || '').toLowerCase();
++            var favorites = getFavorites();
++            var recent = getRecent();
++            var html = '';
++
++            var filteredCategories = [];
++            for (var c = 0; c < categories.length; c++) {
++                var category = categories[c];
++                var filteredTypes = [];
++                for (var t = 0; t < category.types.length; t++) {
++                    var type = category.types[t];
++                    var name = (type.name || '').toLowerCase();
++
++                    if (tab === 'favorites' && favorites.indexOf(type.id) === -1) {
++                        continue;
++                    }
++                    if (tab === 'recent' && recent.indexOf(type.id) === -1) {
++                        continue;
++                    }
++                    if (searchTerm && name.indexOf(searchTerm) === -1) {
++                        continue;
++                    }
++                    filteredTypes.push(type);
++                }
++                if (filteredTypes.length > 0) {
++                    filteredCategories.push({
++                        name: category.name,
++                        types: filteredTypes
++                    });
++                }
++            }
++
++            if (filteredCategories.length === 0) {
++                html = '<div class="polymorphic-type-select__empty">' +
++                    gettext('No types found.') + '</div>';
++            } else {
++                for (var i = 0; i < filteredCategories.length; i++) {
++                    var cat = filteredCategories[i];
++                    html += '<div class="polymorphic-type-select__category">';
++                    html += '<h3 class="polymorphic-type-select__category-name">' +
++                        escapeHtml(cat.name) + '</h3>';
++                    html += '<div class="polymorphic-type-select__type-list">';
++                    for (var j = 0; j < cat.types.length; j++) {
++                        var tpe = cat.types[j];
++                        var favClass = isFavorite(tpe.id) ? 'is-favorite' : '';
++                        var selectedClass = selectedTypeId === tpe.id ? 'is-selected' : '';
++                        html += '<div class="polymorphic-type-select__type-item ' +
++                            favClass + ' ' + selectedClass +
++                            '" data-type-id="' + tpe.id + '">';
++                        html += '<div class="polymorphic-type-select__type-info">';
++                        html += '<span class="polymorphic-type-select__type-name">' +
++                            escapeHtml(tpe.name) + '</span>';
++                        if (tpe.docstring) {
++                            html += '<span class="polymorphic-type-select__type-desc">' +
++                                escapeHtml(tpe.docstring) + '</span>';
++                        }
++                        html += '</div>';
++                        html += '<button type="button" class="polymorphic-type-select__fav-btn" ' +
++                            'data-fav-id="' + tpe.id + '" title="' +
++                            gettext('Toggle favorite') + '">';
++                        html += isFavorite(tpe.id) ? '&#9733;' : '&#9734;';
++                        html += '</button>';
++                        html += '</div>';
++                    }
++                    html += '</div></div>';
++                }
++            }
++
++            categoriesContainer.innerHTML = html;
++
++            var typeItems = categoriesContainer.querySelectorAll('.polymorphic-type-select__type-item');
++            for (var k = 0; k < typeItems.length; k++) {
++                typeItems[k].addEventListener('click', function(e) {
++                    if (e.target.closest('.polymorphic-type-select__fav-btn')) {
++                        return;
++                    }
++                    var typeId = parseInt(this.getAttribute('data-type-id'), 10);
++                    selectType(typeId);
++                });
++            }
++
++            var favButtons = categoriesContainer.querySelectorAll('.polymorphic-type-select__fav-btn');
++            for (var m = 0; m < favButtons.length; m++) {
++                favButtons[m].addEventListener('click', function(e) {
++                    e.stopPropagation();
++                    var favId = parseInt(this.getAttribute('data-fav-id'), 10);
++                    var added = toggleFavorite(favId);
++                    this.innerHTML = added ? '&#9733;' : '&#9734;';
++                    var parentItem = this.closest('.polymorphic-type-select__type-item');
++                    if (added) {
++                        parentItem.classList.add('is-favorite');
++                    } else {
++                        parentItem.classList.remove('is-favorite');
++                    }
++                });
++            }
++        }
++
++        function selectType(typeId) {
++            selectedTypeId = typeId;
++            hiddenInput.value = typeId;
++            submitButton.disabled = false;
++
++            var allItems = categoriesContainer.querySelectorAll(
++                '.polymorphic-type-select__type-item');
++            for (var i = 0; i < allItems.length; i++) {
++                var itemTypeId = parseInt(allItems[i].getAttribute('data-type-id'), 10);
++                if (itemTypeId === typeId) {
++                    allItems[i].classList.add('is-selected');
++                } else {
++                    allItems[i].classList.remove('is-selected');
++                }
++            }
++        }
++
++        function switchTab(tabName) {
++            var tabs = tabsContainer.querySelectorAll('.polymorphic-type-select__tab');
++            for (var i = 0; i < tabs.length; i++) {
++                tabs[i].classList.remove('active');
++            }
++            var activeTab = tabsContainer.querySelector('[data-tab="' + tabName + '"]');
++            if (activeTab) {
++                activeTab.classList.add('active');
++            }
++            renderCategories(allCategories, searchInput.value, tabName);
++        }
++
++        function escapeHtml(text) {
++            var div = document.createElement('div');
++            div.appendChild(document.createTextNode(text));
++            return div.innerHTML;
++        }
++
++        function gettext(text) {
++            return text;
++        }
++
++        function loadTypes() {
++            fetch(typeDataUrl, {
++                headers: {
++                    'X-Requested-With': 'XMLHttpRequest'
++                }
++            })
++            .then(function(response) {
++                if (!response.ok) {
++                    throw new Error('Failed to load types');
++                }
++                return response.json();
++            })
++            .then(function(data) {
++                allCategories = data.categories || [];
++                renderCategories(allCategories, '', 'all');
++            })
++            .catch(function(error) {
++                categoriesContainer.innerHTML =
++                    '<div class="polymorphic-type-select__error">' +
++                    gettext('Failed to load types. Please try again.') +
++                    '</div>';
++            });
++        }
++
++        searchInput.addEventListener('input', function() {
++            var activeTab = tabsContainer.querySelector('.polymorphic-type-select__tab.active');
++            var tabName = activeTab ? activeTab.getAttribute('data-tab') : 'all';
++            renderCategories(allCategories, this.value, tabName);
++        });
++
++        var tabs = tabsContainer.querySelectorAll('.polymorphic-type-select__tab');
++        for (var i = 0; i < tabs.length; i++) {
++            tabs[i].addEventListener('click', function() {
++                switchTab(this.getAttribute('data-tab'));
++            });
++        }
++
++        submitButton.addEventListener('click', function(e) {
++            if (!selectedTypeId) {
++                e.preventDefault();
++                return;
++            }
++            addRecent(selectedTypeId);
++        });
++
++        loadTypes();
++    }
++
++    document.addEventListener('DOMContentLoaded', function() {
++        var containers = document.querySelectorAll('.polymorphic-type-select');
++        for (var i = 0; i < containers.length; i++) {
++            initWidget(containers[i]);
++        }
++    });
++
++    if (document.readyState !== 'loading') {
++        var containers = document.querySelectorAll('.polymorphic-type-select');
++        for (var i = 0; i < containers.length; i++) {
++            initWidget(containers[i]);
++        }
++    }
++})();
+\ No newline at end of file
+diff --git a/src/polymorphic/templates/admin/polymorphic/add_type_form.html b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+index 20cc8ab..70ca751 100644
+--- a/src/polymorphic/templates/admin/polymorphic/add_type_form.html
++++ b/src/polymorphic/templates/admin/polymorphic/add_type_form.html
+@@ -1,11 +1,14 @@
+ {% extends "admin/change_form.html" %}
++{% load i18n %}
+ 
+-{% if save_on_top %}
+-  {% block submit_buttons_top %}
+-    {% include 'admin/submit_line.html' with show_save=1 %}
+-  {% endblock %}
+-{% endif %}
+-
+-{% block submit_buttons_bottom %}
+-  {% include 'admin/submit_line.html' with show_save=1 %}
++{% block content %}
++<div id="content-main">
++    <form method="post" action="{{ form_url }}" novalidate>
++        {% csrf_token %}
++        {{ adminform.form.ct_id }}
++    </form>
++</div>
+ {% endblock %}
++
++{% block submit_buttons_bottom %}{% endblock %}
++{% block submit_buttons_top %}{% endblock %}
+\ No newline at end of file
+diff --git a/src/polymorphic/templates/admin/polymorphic/widgets/type_select.html b/src/polymorphic/templates/admin/polymorphic/widgets/type_select.html
+new file mode 100644
+index 0000000..1c8a434
+--- /dev/null
++++ b/src/polymorphic/templates/admin/polymorphic/widgets/type_select.html
+@@ -0,0 +1,30 @@
++<div class="polymorphic-type-select" data-type-data-url="{{ widget.type_data_url }}" data-initial-choices="{{ widget.initial_choices }}">
++    <input type="hidden" name="{{ widget.name }}"{% if widget.value %} value="{{ widget.value }}"{% endif %} id="{{ widget.attrs.id }}" data-polymorphic-type-input>
++
++    <div class="polymorphic-type-select__panel">
++        <div class="polymorphic-type-select__header">
++            <h2 class="polymorphic-type-select__title">{% translate "Select Type" %}</h2>
++        </div>
++
++        <div class="polymorphic-type-select__search">
++            <input type="text" class="polymorphic-type-select__search-input" placeholder="{% translate 'Search types...' %}" data-polymorphic-search>
++        </div>
++
++        <div class="polymorphic-type-select__tabs" data-polymorphic-tabs>
++            <button type="button" class="polymorphic-type-select__tab active" data-tab="all">{% translate "All" %}</button>
++            <button type="button" class="polymorphic-type-select__tab" data-tab="favorites">{% translate "Favorites" %}</button>
++            <button type="button" class="polymorphic-type-select__tab" data-tab="recent">{% translate "Recent" %}</button>
++        </div>
++
++        <div class="polymorphic-type-select__categories" data-polymorphic-categories>
++            <div class="polymorphic-type-select__loading">
++                <span class="polymorphic-type-select__spinner"></span>
++                {% translate "Loading types..." %}
++            </div>
++        </div>
++    </div>
++
++    <div class="submit-row polymorphic-type-select__submit">
++        <input type="submit" value="{% translate 'Next' %}" class="default" data-polymorphic-submit disabled>
++    </div>
++</div>
+\ No newline at end of file
