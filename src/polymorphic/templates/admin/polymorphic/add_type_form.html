@@ -1,11 +1,71 @@
 {% extends "admin/change_form.html" %}
+{% load static %}
 
-{% if save_on_top %}
-  {% block submit_buttons_top %}
-    {% include 'admin/submit_line.html' with show_save=1 %}
-  {% endblock %}
-{% endif %}
+{% block content %}
+<div id="content-main">
+    <form method="post" id="polymorphic-type-form" {% if adminform.form.is_multipart %}enctype="multipart/form-data"{% endif %}>
+        {% csrf_token %}
+        {% for field in adminform.form.hidden_fields %}{{ field }}{% endfor %}
+        {% if polymorphic_type_picker %}
+            <div id="polymorphic-type-picker"
+                 data-child-types-endpoint="{{ child_types_endpoint }}"
+                 data-favorites-endpoint="{{ favorites_endpoint }}"
+                 data-extra-query-string="{{ extra_query_string }}"
+                 data-is-popup="{% if is_popup %}1{% endif %}">
+                <div class="polymorphic-picker-header">
+                    <input type="search"
+                           class="polymorphic-picker-search"
+                           placeholder="{% trans "Search for a type…" %}"
+                           autocomplete="off" />
+                    <nav class="polymorphic-picker-tabs" role="tablist">
+                        <button type="button" class="polymorphic-picker-tab is-active" data-tab="favorites">
+                            <span class="polymorphic-picker-tab-label">{% trans "Favorites" %}</span>
+                        </button>
+                        <button type="button" class="polymorphic-picker-tab" data-tab="recent">
+                            <span class="polymorphic-picker-tab-label">{% trans "Recent" %}</span>
+                        </button>
+                        <button type="button" class="polymorphic-picker-tab" data-tab="all">
+                            <span class="polymorphic-picker-tab-label">{% trans "All" %}</span>
+                        </button>
+                    </nav>
+                </div>
+                <div class="polymorphic-picker-body">
+                    <div class="polymorphic-picker-empty" style="display:none;">
+                        {% trans "No types match your search." %}
+                    </div>
+                    <div class="polymorphic-picker-loading">
+                        <span class="polymorphic-picker-spinner" aria-hidden="true"></span>
+                        <span>{% trans "Loading available types…" %}</span>
+                    </div>
+                    <div class="polymorphic-picker-list" role="list"></div>
+                </div>
+            </div>
+            <div class="submit-row">
+                <input type="submit" value="{% trans "Select" %}" class="default" id="polymorphic-picker-submit" disabled />
+            </div>
+        {% else %}
+            {% for fieldset in adminform %}
+                {% include "admin/includes/fieldset.html" %}
+            {% endfor %}
+            {% if save_on_top %}
+                {% block submit_buttons_top %}
+                    {% include 'admin/submit_line.html' with show_save=1 %}
+                {% endblock %}
+            {% endif %}
+            {% block submit_buttons_bottom %}
+                {% include 'admin/submit_line.html' with show_save=1 %}
+            {% endblock %}
+        {% endif %}
+    </form>
+</div>
+{% endblock %}
 
-{% block submit_buttons_bottom %}
-  {% include 'admin/submit_line.html' with show_save=1 %}
+{% block extrastyle %}
+{{ block.super }}
+<link rel="stylesheet" type="text/css" href="{% static "admin/polymorphic/picker.css" %}" />
+{% endblock %}
+
+{% block admin_change_form_document_ready %}
+{{ block.super }}
+<script src="{% static "admin/polymorphic/picker.js" %}" defer></script>
 {% endblock %}

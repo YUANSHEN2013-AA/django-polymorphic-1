@@ -17,7 +17,11 @@ class PolymorphicModelChoiceForm(forms.Form):
         label=type_label, widget=AdminRadioSelect(attrs={"class": "radiolist"})
     )
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, use_picker: bool = False, **kwargs: Any) -> None:
         # Allow to easily redefine the label (a commonly expected usecase)
         super().__init__(*args, **kwargs)
         self.fields["ct_id"].label = self.type_label
+        if use_picker:
+            # When the rich picker is used, JavaScript is responsible for
+            # setting the value of ``ct_id`` before submitting the form.
+            self.fields["ct_id"].widget = forms.HiddenInput()
