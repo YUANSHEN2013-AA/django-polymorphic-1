@@ -115,6 +115,7 @@ INSTALLED_APPS = [
     "polymorphic.tests.other",
     "polymorphic.tests.test_migrations",
     "polymorphic.tests.examples.views",
+    "pexp",
     "polymorphic",
     "django.contrib.staticfiles",
     "django.contrib.auth",

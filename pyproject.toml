@@ -128,9 +128,9 @@ select = [
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "polymorphic.tests.settings"
-pythonpath = ["src"]
+pythonpath = ["src", "example"]
 django_find_project = false
-testpaths = ["src/polymorphic/tests"]
+testpaths = ["src/polymorphic/tests", "example/pexp/tests"]
 python_files = "test*.py"
 python_classes = "Test*"
 python_functions = "test_*"
