@@ -128,9 +128,9 @@ select = [
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "polymorphic.tests.settings"
-pythonpath = ["src"]
+pythonpath = ["src", "example"]
 django_find_project = false
-testpaths = ["src/polymorphic/tests"]
+testpaths = ["src/polymorphic/tests", "example/pexp/tests"]
 python_files = "test*.py"
 python_classes = "Test*"
 python_functions = "test_*"
@@ -142,11 +142,15 @@ markers = [
 addopts = [
     "--strict-markers",
    "-m", "not integration",
+   "--cov=pexp.models",
+   "--cov-report=html",
+   "--cov-report=term-missing",
 ]
 
 [tool.coverage.run]
 source = [
-    "src"
+    "src",
+    "example/pexp"
 ]
 omit = ["*/migrations/*", "*/tests/*", "src/polymorphic/tests/*"]
 branch = true

@@ -1,0 +1,121 @@
+import pytest
+from django.db import models
+
+from pexp.models import (
+    Project, ArtProject, ResearchProject,
+    UUIDModelA, UUIDModelB, UUIDModelC,
+    ProxyBase, ProxyA, ProxyB,
+    TestModelA, TestModelB, TestModelC,
+    NormalModelA, NormalModelB, NormalModelC
+)
+
+pytestmark = pytest.mark.django_db
+
+def test_project_roundtrip_and_get_real_instance():
+    # Multi-table roundtrip
+    p1 = Project.objects.create(topic="Generic")
+    a1 = ArtProject.objects.create(topic="Art", artist="Picasso")
+    r1 = ResearchProject.objects.create(topic="Science", supervisor="Dr. Smith")
+
+    projects = list(Project.objects.order_by("pk"))
+    assert len(projects) == 3
+    
+    # Check types (roundtrip)
+    assert type(projects[0]) is Project
+    assert type(projects[1]) is ArtProject
+    assert type(projects[2]) is ResearchProject
+
+    # Check get_real_instance
+    base_p1 = Project.base_objects.get(pk=a1.pk)
+    assert type(base_p1) is Project
+    real_a1 = base_p1.get_real_instance()
+    assert type(real_a1) is ArtProject
+    assert real_a1.artist == "Picasso"
+
+def test_instance_of():
+    p1 = Project.objects.create(topic="Generic")
+    a1 = ArtProject.objects.create(topic="Art", artist="Picasso")
+    r1 = ResearchProject.objects.create(topic="Science", supervisor="Dr. Smith")
+
+    # instance_of should filter by specific subclasses
+    arts = Project.objects.instance_of(ArtProject)
+    assert list(arts) == [a1]
+
+    researches = Project.objects.instance_of(ResearchProject)
+    assert list(researches) == [r1]
+
+    # instance_of base class should return all
+    all_projects = Project.objects.instance_of(Project)
+    assert set(all_projects) == {p1, a1, r1}
+
+def test_delete_keep_parents():
+    # Test delete(keep_parents=True)
+    a1 = ArtProject.objects.create(topic="Art", artist="Picasso")
+    pk = a1.pk
+
+    # Delete the child but keep the parent
+    a1.delete(keep_parents=True)
+
+    # ArtProject should be gone
+    assert ArtProject.objects.filter(pk=pk).count() == 0
+
+    # Project should still exist
+    parent = Project.objects.get(pk=pk)
+    assert type(parent) is Project
+    assert parent.topic == "Art"
+
+def test_uuid_models():
+    u1 = UUIDModelA.objects.create(field1="A")
+    u2 = UUIDModelB.objects.create(field1="A2", field2="B")
+    u3 = UUIDModelC.objects.create(field1="A3", field2="B2", field3="C")
+
+    # Roundtrip
+    uuids = list(UUIDModelA.objects.order_by("field1"))
+    assert type(uuids[0]) is UUIDModelA
+    assert type(uuids[1]) is UUIDModelB
+    assert type(uuids[2]) is UUIDModelC
+
+    # get_real_instance
+    base_u3 = UUIDModelA.base_objects.get(pk=u3.pk)
+    real_u3 = base_u3.get_real_instance()
+    assert type(real_u3) is UUIDModelC
+
+    # instance_of
+    assert list(UUIDModelA.objects.instance_of(UUIDModelC)) == [u3]
+
+def test_proxy_models():
+    # Test proxy models
+    pb = ProxyBase.objects.create(title="Base")
+    pa = ProxyA.objects.create(title="Proxy A")
+    pb2 = ProxyB.objects.create(title="Proxy B")
+
+    proxies = list(ProxyBase.objects.order_by("pk"))
+    assert type(proxies[0]) is ProxyBase
+    assert type(proxies[1]) is ProxyA
+    assert type(proxies[2]) is ProxyB
+
+    assert proxies[0].__unicode__() == f"<ProxyBase[type={proxies[0].polymorphic_ctype}]: Base>"
+    assert proxies[1].__unicode__() == "<ProxyA: Proxy A>"
+    assert proxies[2].__unicode__() == "<ProxyB: Proxy B>"
+
+def test_test_models():
+    t1 = TestModelA.objects.create(field1="A")
+    t2 = TestModelB.objects.create(field1="A", field2="B")
+    t3 = TestModelC.objects.create(field1="A", field2="B", field3="C")
+    t3.field4.add(t2)
+
+    tests = list(TestModelA.objects.order_by("pk"))
+    assert type(tests[0]) is TestModelA
+    assert type(tests[1]) is TestModelB
+    assert type(tests[2]) is TestModelC
+
+def test_normal_models():
+    n1 = NormalModelA.objects.create(field1="A")
+    n2 = NormalModelB.objects.create(field1="A", field2="B")
+    n3 = NormalModelC.objects.create(field1="A", field2="B", field3="C")
+
+    # Normal models do not downcast
+    normals = list(NormalModelA.objects.order_by("pk"))
+    assert type(normals[0]) is NormalModelA
+    assert type(normals[1]) is NormalModelA
+    assert type(normals[2]) is NormalModelA
