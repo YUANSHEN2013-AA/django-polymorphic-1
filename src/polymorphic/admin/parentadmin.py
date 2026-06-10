@@ -4,6 +4,7 @@ The parent admin displays the list view of the base model.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Generic, cast
 
 from django.contrib import admin
@@ -12,8 +13,9 @@ from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.db import models
-from django.http import Http404, HttpResponseRedirect
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.template.response import TemplateResponse
+from django.urls import path
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
 from typing_extensions import TypeVar
@@ -30,6 +32,10 @@ if TYPE_CHECKING:
     _ModelAdminBase = admin.ModelAdmin[_ModelT]
 else:
     _ModelAdminBase = admin.ModelAdmin
+
+_SESSION_FAVORITES_KEY = "polymorphic_admin_favorites"
+_SESSION_RECENT_KEY = "polymorphic_admin_recent"
+_MAX_RECENT_ITEMS = 10
 
 
 class RegistrationClosed(RuntimeError):
@@ -73,6 +79,14 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
     #: If your primary key consists of string values, update this regular expression.
     pk_regex = r"(\d+|__fk__)"
 
+    #: Whether to enable the enhanced type selector with search, favorites, recent, and categories.
+    enhanced_type_selector = False
+
+    #: Group child types by app label for categorized display.
+    #: Can be a callable that receives (request, child_models) and returns a dict of {group_name: [model, ...]}.
+    #: Set to None to disable grouping.
+    child_type_groups = None
+
     def __init__(self, model: type[_ModelT], admin_site: Any, *args: Any, **kwargs: Any) -> None:
         super().__init__(model, admin_site, *args, **kwargs)
         self._is_setup = False
@@ -86,9 +100,6 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
 
         self._child_models = self.get_child_models()
 
-        # Make absolutely sure that the child models don't use the old 0.9 format,
-        # as of polymorphic 1.4 this deprecated configuration is no longer supported.
-        # Instead, register the child models in the admin too.
         if self._child_models and not issubclass(self._child_models[0], models.Model):
             raise ImproperlyConfigured(
                 "Since django-polymorphic 1.4, the `child_models` attribute "
@@ -131,6 +142,111 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             choices.append((ct.id, model._meta.verbose_name))
         return choices
 
+    def get_child_type_groups(self, request):
+        """
+        Return a dict of grouped child types for categorized display.
+        By default, groups by app label.
+
+        Override this method or set the ``child_type_groups`` attribute
+        to customize grouping.
+
+        Returns a list of dicts: [{"label": str, "models": [{"ct_id": int, "name": str, "model_name": str}]}]
+        """
+        self._lazy_setup()
+        choices = self.get_child_type_choices(request, "add")
+        content_types = ContentType.objects.get_for_models(
+            *self.get_child_models(), for_concrete_models=False
+        )
+
+        if self.child_type_groups is not None:
+            if callable(self.child_type_groups):
+                return self.child_type_groups(request, self.get_child_models())
+            return self.child_type_groups
+
+        groups = {}
+        for model, ct in content_types.items():
+            if ct.id not in [c[0] for c in choices]:
+                continue
+            app_label = model._meta.app_label
+            if app_label not in groups:
+                from django.apps import apps
+                app_config = apps.get_app_config(app_label)
+                groups[app_label] = {
+                    "label": app_config.verbose_name if app_config else app_label.title(),
+                    "models": [],
+                }
+            groups[app_label]["models"].append({
+                "ct_id": ct.id,
+                "name": force_str(model._meta.verbose_name),
+                "model_name": model._meta.model_name,
+            })
+
+        return list(groups.values())
+
+    def get_child_types_data(self, request):
+        """
+        Return the full data structure for the enhanced type selector.
+        This includes all types, groups, favorites, and recent items.
+        """
+        self._lazy_setup()
+        choices = self.get_child_type_choices(request, "add")
+        content_types = ContentType.objects.get_for_models(
+            *self.get_child_models(), for_concrete_models=False
+        )
+
+        all_types = []
+        for model, ct in content_types.items():
+            if ct.id not in [c[0] for c in choices]:
+                continue
+            all_types.append({
+                "ct_id": ct.id,
+                "name": force_str(model._meta.verbose_name),
+                "model_name": model._meta.model_name,
+                "app_label": model._meta.app_label,
+            })
+
+        groups = self.get_child_type_groups(request)
+        favorites = self._get_favorites(request)
+        recent = self._get_recent(request)
+
+        return {
+            "all_types": all_types,
+            "groups": groups,
+            "favorites": [t for t in all_types if t["ct_id"] in favorites],
+            "recent": [t for t in all_types if t["ct_id"] in recent],
+        }
+
+    def _get_session_key(self, suffix):
+        opts = self.model._meta
+        return f"{_SESSION_FAVORITES_KEY}_{opts.app_label}_{opts.model_name}_{suffix}"
+
+    def _get_favorites(self, request):
+        key = self._get_session_key("favs")
+        return request.session.get(key, [])
+
+    def _toggle_favorite(self, request, ct_id):
+        key = self._get_session_key("favs")
+        favorites = request.session.get(key, [])
+        if ct_id in favorites:
+            favorites.remove(ct_id)
+        else:
+            favorites.append(ct_id)
+        request.session[key] = favorites
+        return favorites
+
+    def _get_recent(self, request):
+        key = self._get_session_key("recent")
+        return request.session.get(key, [])
+
+    def _add_recent(self, request, ct_id):
+        key = self._get_session_key("recent")
+        recent = request.session.get(key, [])
+        if ct_id in recent:
+            recent.remove(ct_id)
+        recent.insert(0, ct_id)
+        recent = recent[:_MAX_RECENT_ITEMS]
+        request.session[key] = recent
+
     def _get_real_admin(self, object_id, super_if_self=True):
         try:
             obj = (
@@ -144,27 +260,22 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         try:
             ct = ContentType.objects.get_for_id(ct_id)
         except ContentType.DoesNotExist as e:
-            raise Http404(e)  # Handle invalid GET parameters
+            raise Http404(e)
 
         model_class = ct.model_class()
         if not model_class:
-            # Handle model deletion
             app_label, model = ct.natural_key()
             raise Http404(f"No model found for '{app_label}.{model}'.")
 
         return self._get_real_admin_by_model(model_class, super_if_self=super_if_self)
 
     def _get_real_admin_by_model(self, model_class, super_if_self=True):
-        # In case of a ?ct_id=### parameter, the view is already checked for permissions.
-        # Hence, make sure this is a derived object, or risk exposing other admin interfaces.
         if model_class not in self._child_models:
             raise PermissionDenied(
                 f"Invalid model '{model_class}', it must be registered as child model."
             )
 
         try:
-            # HACK: the only way to get the instance of an model admin,
-            # is to read the registry of the AdminSite.
             real_admin = self._child_admin_site._registry[model_class]
         except KeyError:
             raise ChildAdminNotRegistered(
@@ -177,7 +288,6 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             return real_admin
 
     def get_queryset(self, request):
-        # optimize the list display.
         qs = cast(PolymorphicQuerySet, super().get_queryset(request))
         if not self.polymorphic_list:
             qs = qs.non_polymorphic()
@@ -187,13 +297,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         """Redirect the add view to the real admin."""
         ct_id = int(request.GET.get("ct_id", 0))
         if not ct_id:
-            # Display choices
             return self.add_type_view(request)
         else:
+            self._add_recent(request, ct_id)
             real_admin = self._get_real_admin_by_ct(ct_id)
-            # rebuild form_url, otherwise libraries below will override it.
-            # Preserve popup-related parameters to ensure popup functionality works
-            # correctly even after validation errors (issue #612)
             form_url = add_preserved_filters(
                 {
                     "preserved_filters": request.GET.urlencode(),
@@ -209,14 +316,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         return real_admin.change_view(request, object_id, *args, **kwargs)
 
     def changeform_view(self, request, object_id=None, *args, **kwargs):
-        # The `changeform_view` is available as of Django 1.7, combining the add_view and change_view.
-        # As it's directly called by django-reversion, this method is also overwritten to make sure it
-        # also redirects to the child admin.
         if object_id:
             real_admin = self._get_real_admin(object_id)
             return real_admin.changeform_view(request, object_id, *args, **kwargs)
         else:
-            # Add view. As it should already be handled via `add_view`, this means something custom is done here!
             return super().changeform_view(request, object_id, *args, **kwargs)
 
     def history_view(self, request, object_id, extra_context=None):
@@ -235,32 +338,157 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         """
         urls = super().get_urls()
 
-        # At this point. all admin code needs to be known.
         self._lazy_setup()
 
-        return urls
+        info = self.model._meta.app_label, self.model._meta.model_name
+        custom_urls = [
+            path(
+                "child-types-api/",
+                self.admin_site.admin_view(self.child_types_api_view),
+                name="%s_%s_child_types_api" % info,
+            ),
+            path(
+                "toggle-favorite/<int:ct_id>/",
+                self.admin_site.admin_view(self.toggle_favorite_api_view),
+                name="%s_%s_toggle_favorite" % info,
+            ),
+        ]
+        return custom_urls + urls
+
+    def child_types_api_view(self, request):
+        """
+        API endpoint that returns child types as JSON.
+        Supports async loading of the child type list.
+
+        Query parameters:
+        - search: filter types by name
+        """
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+
+        data = self.get_child_types_data(request)
+
+        search = request.GET.get("search", "").strip().lower()
+        if search:
+            data["all_types"] = [
+                t for t in data["all_types"]
+                if search in t["name"].lower() or search in t["model_name"].lower()
+            ]
+            data["groups"] = []
+            for group in self.get_child_type_groups(request):
+                filtered_models = [
+                    m for m in group["models"]
+                    if search in m["name"].lower() or search in m["model_name"].lower()
+                ]
+                if filtered_models:
+                    data["groups"].append({
+                        "label": group["label"],
+                        "models": filtered_models,
+                    })
+            data["favorites"] = [
+                t for t in data["favorites"]
+                if search in t["name"].lower() or search in t["model_name"].lower()
+            ]
+            data["recent"] = [
+                t for t in data["recent"]
+                if search in t["name"].lower() or search in t["model_name"].lower()
+            ]
+
+        return JsonResponse(data)
+
+    def toggle_favorite_api_view(self, request, ct_id):
+        """
+        API endpoint to toggle a child type as favorite.
+        Only POST requests are allowed.
+        """
+        if request.method != "POST":
+            return JsonResponse({"error": "Method not allowed"}, status=405)
+
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+
+        self._lazy_setup()
+        choices = self.get_child_type_choices(request, "add")
+        valid_ct_ids = [c[0] for c in choices]
+        if ct_id not in valid_ct_ids:
+            return JsonResponse({"error": "Invalid content type"}, status=400)
+
+        favorites = self._toggle_favorite(request, ct_id)
+        return JsonResponse({"favorites": favorites, "ct_id": ct_id, "is_favorite": ct_id in favorites})
 
     def add_type_view(self, request, form_url=""):
         """
         Display a choice form to select which page type to add.
+        Supports both the enhanced type selector and the legacy radio form.
         """
         if not self.has_add_permission(request):
             raise PermissionDenied
 
         extra_qs = ""
         if request.META["QUERY_STRING"]:
-            # QUERY_STRING is bytes in Python 3, using force_str() to decode it as string.
-            # See QueryDict how Django deals with that.
-            # TODO: should this use a Django method instead of manipulating the string directly?
             extra_qs = f"&{force_str(request.META['QUERY_STRING'])}"
 
         choices = self.get_child_type_choices(request, "add")
         if len(choices) == 0:
             raise PermissionDenied
         if len(choices) == 1:
+            self._add_recent(request, choices[0][0])
             return HttpResponseRedirect(f"?ct_id={choices[0][0]}{extra_qs}")
 
-        # Create form
+        if self.enhanced_type_selector:
+            return self._render_enhanced_type_selector(request, choices, extra_qs)
+
+        return self._render_legacy_type_form(request, choices, extra_qs, form_url)
+
+    def _render_enhanced_type_selector(self, request, choices, extra_qs):
+        """
+        Render the enhanced type selector with search, favorites, recent, and categories.
+        """
+        opts = self.model._meta
+        api_url = f"../child-types-api/"
+        toggle_favorite_url = f"../toggle-favorite/"
+
+        types_data = self.get_child_types_data(request)
+
+        csrf_token = ""
+        if hasattr(request, 'META'):
+            from django.middleware.csrf import get_token
+            csrf_token = get_token(request)
+
+        pts_options = {
+            "api_url": api_url,
+            "toggle_favorite_url": toggle_favorite_url,
+            "extra_qs": extra_qs,
+            "types_data": types_data,
+            "csrf_token": csrf_token,
+        }
+
+        context = {
+            "title": _("Add %s") % force_str(opts.verbose_name),
+            "is_popup": ("_popup" in request.POST or "_popup" in request.GET),
+            "app_label": opts.app_label,
+            "opts": opts,
+            "add": True,
+            "has_change_permission": self.has_change_permission(request),
+            "pts_options_json": json.dumps(pts_options),
+            "enhanced_type_selector": True,
+            **self.admin_site.each_context(request),
+        }
+
+        templates = self.add_type_template or [
+            f"admin/{opts.app_label}/{opts.object_name.lower()}/add_type_form.html",
+            f"admin/{opts.app_label}/add_type_form.html",
+            "admin/polymorphic/add_type_form.html",
+            "admin/add_type_form.html",
+        ]
+
+        request.current_app = self.admin_site.name
+        return self.admin_site.admin_view(TemplateResponse)(request, templates, context)
+
+    def _render_legacy_type_form(self, request, choices, extra_qs, form_url):
+        """
+        Render the legacy radio button form for backward compatibility.
+        """
         form = self.add_type_form(
             data=request.POST if request.method == "POST" else None,
             initial={"ct_id": choices[0][0]},
@@ -268,9 +496,10 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         setattr(form.fields["ct_id"], "choices", choices)
 
         if form.is_valid():
-            return HttpResponseRedirect(f"?ct_id={form.cleaned_data['ct_id']}{extra_qs}")
+            ct_id = form.cleaned_data["ct_id"]
+            self._add_recent(request, ct_id)
+            return HttpResponseRedirect(f"?ct_id={ct_id}{extra_qs}")
 
-        # Wrap in all admin layout
         fieldsets = ((None, {"fields": ("ct_id",)}),)
         adminForm = AdminForm(form, fieldsets, {}, model_admin=self)  # type: ignore[arg-type]
         media = self.media + adminForm.media
@@ -283,6 +512,7 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
             "media": media,
             "errors": AdminErrorList(form, ()),  # type: ignore[arg-type]
             "app_label": opts.app_label,
+            "enhanced_type_selector": False,
         }
         return self.render_add_type_form(request, context, form_url)
 
@@ -306,7 +536,7 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         templates = self.add_type_template or [
             f"admin/{app_label}/{opts.object_name.lower()}/add_type_form.html",  # type: ignore[union-attr]
             f"admin/{app_label}/add_type_form.html",
-            "admin/polymorphic/add_type_form.html",  # added default here
+            "admin/polymorphic/add_type_form.html",
             "admin/add_type_form.html",
         ]
 
@@ -318,7 +548,6 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         opts = self.model._meta
         app_label = opts.app_label
 
-        # Pass the base options
         assert self.base_model is not None, "base_model must be set"
         base_opts = self.base_model._meta
         base_app_label = base_opts.app_label
@@ -326,8 +555,18 @@ class PolymorphicParentModelAdmin(_ModelAdminBase, Generic[_ModelT]):
         return [
             f"admin/{app_label}/{opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
             f"admin/{app_label}/change_list.html",
-            # Added base class:
             f"admin/{base_app_label}/{base_opts.object_name.lower()}/change_list.html",  # type: ignore[union-attr]
             f"admin/{base_app_label}/change_list.html",
             "admin/change_list.html",
         ]
+
+    @property
+    def media(self):
+        base = super().media
+        if self.enhanced_type_selector:
+            from django.forms import Media
+            return base + Media(
+                js=("polymorphic/js/polymorphic_type_selector.js",),
+                css={"all": ("polymorphic/css/polymorphic_type_selector.css",)},
+            )
+        return base

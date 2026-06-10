@@ -1,0 +1,200 @@
+.polymorphic-type-selector {
+    max-width: 600px;
+    margin: 20px auto;
+    font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.polymorphic-type-selector.pts-loading {
+    opacity: 0.6;
+    pointer-events: none;
+}
+
+.pts-search-box {
+    position: relative;
+    margin-bottom: 16px;
+}
+
+.pts-search-icon {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 16px;
+    color: var(--body-quiet-color, #666);
+    pointer-events: none;
+}
+
+.pts-search-input {
+    width: 100%;
+    padding: 10px 12px 10px 38px;
+    border: 1px solid var(--border-color, #ccc);
+    border-radius: 6px;
+    font-size: 14px;
+    background-color: var(--body-bg, #fff);
+    color: var(--body-fg, #333);
+    box-sizing: border-box;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.pts-search-input:focus {
+    outline: none;
+    border-color: var(--primary, #79aec8);
+    box-shadow: 0 0 0 3px rgba(121, 174, 200, 0.25);
+}
+
+.pts-tabs {
+    display: flex;
+    border-bottom: 2px solid var(--border-color, #ddd);
+    margin-bottom: 16px;
+    gap: 0;
+}
+
+.pts-tab {
+    padding: 8px 18px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--body-quiet-color, #666);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.2s, border-color 0.2s;
+}
+
+.pts-tab:hover {
+    color: var(--body-fg, #333);
+}
+
+.pts-tab-active {
+    color: var(--primary, #79aec8);
+    border-bottom-color: var(--primary, #79aec8);
+}
+
+.pts-content {
+    min-height: 100px;
+}
+
+.pts-type-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.pts-type-item {
+    display: flex;
+    align-items: center;
+    padding: 0;
+    border-bottom: 1px solid var(--border-color, #eee);
+    transition: background-color 0.15s;
+}
+
+.pts-type-item:hover {
+    background-color: var(--darkened-bg, #f8f8f8);
+}
+
+.pts-type-item:last-child {
+    border-bottom: none;
+}
+
+.pts-type-link {
+    flex: 1;
+    padding: 10px 14px;
+    text-decoration: none;
+    color: var(--body-fg, #333);
+    font-size: 14px;
+    display: block;
+    transition: color 0.15s;
+}
+
+.pts-type-link:hover {
+    color: var(--primary, #79aec8);
+}
+
+.pts-fav-btn {
+    padding: 6px 10px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 18px;
+    color: var(--body-quiet-color, #aaa);
+    transition: color 0.2s, transform 0.15s;
+    flex-shrink: 0;
+}
+
+.pts-fav-btn:hover {
+    color: #f0ad4e;
+    transform: scale(1.2);
+}
+
+.pts-fav-active {
+    color: #f0ad4e;
+}
+
+.pts-fav-active:hover {
+    color: #ec971f;
+}
+
+.pts-category-section {
+    margin-bottom: 16px;
+}
+
+.pts-category-header {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--body-quiet-color, #666);
+    margin: 0 0 4px 0;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border-color, #eee);
+}
+
+.pts-empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--body-quiet-color, #999);
+    font-size: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+    .pts-search-input {
+        background-color: var(--body-bg, #212121);
+        color: var(--body-fg, #e0e0e0);
+        border-color: var(--border-color, #333);
+    }
+
+    .pts-search-input:focus {
+        border-color: var(--primary, #79aec8);
+        box-shadow: 0 0 0 3px rgba(121, 174, 200, 0.15);
+    }
+
+    .pts-type-item:hover {
+        background-color: var(--darkened-bg, #2a2a2a);
+    }
+
+    .pts-type-link {
+        color: var(--body-fg, #e0e0e0);
+    }
+
+    .pts-type-link:hover {
+        color: var(--primary, #79aec8);
+    }
+
+    .pts-category-header {
+        color: var(--body-quiet-color, #aaa);
+        border-bottom-color: var(--border-color, #333);
+    }
+
+    .pts-fav-btn {
+        color: var(--body-quiet-color, #666);
+    }
+
+    .pts-fav-btn:hover {
+        color: #f0ad4e;
+    }
+
+    .pts-fav-active {
+        color: #f0ad4e;
+    }
+}
