@@ -105,6 +105,7 @@ elif rdbms == "oracle":  # pragma: no cover
         }
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 INSTALLED_APPS = [
+    "pexp",
     "polymorphic.tests.examples.type_hints.managers",
     "polymorphic.tests.examples.type_hints.one2one",
     "polymorphic.tests.examples.type_hints.m2m",

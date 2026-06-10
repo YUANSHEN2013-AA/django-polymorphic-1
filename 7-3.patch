@@ -1,0 +1,685 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 592854d..8a8180e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -128,7 +128,7 @@ select = [
+ 
+ [tool.pytest.ini_options]
+ DJANGO_SETTINGS_MODULE = "polymorphic.tests.settings"
+-pythonpath = ["src"]
++pythonpath = ["src", "example"]
+ django_find_project = false
+ testpaths = ["src/polymorphic/tests"]
+ python_files = "test*.py"
+@@ -146,7 +146,8 @@ addopts = [
+ 
+ [tool.coverage.run]
+ source = [
+-    "src"
++    "src",
++    "example"
+ ]
+ omit = ["*/migrations/*", "*/tests/*", "src/polymorphic/tests/*"]
+ branch = true
+diff --git a/src/polymorphic/tests/settings.py b/src/polymorphic/tests/settings.py
+index a4a8ef3..961fd38 100644
+--- a/src/polymorphic/tests/settings.py
++++ b/src/polymorphic/tests/settings.py
+@@ -105,6 +105,7 @@ elif rdbms == "oracle":  # pragma: no cover
+         }
+ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+ INSTALLED_APPS = [
++    "pexp",
+     "polymorphic.tests.examples.type_hints.managers",
+     "polymorphic.tests.examples.type_hints.one2one",
+     "polymorphic.tests.examples.type_hints.m2m",
+diff --git a/src/polymorphic/tests/test_pexp.py b/src/polymorphic/tests/test_pexp.py
+new file mode 100644
+index 0000000..ec3fdfc
+--- /dev/null
++++ b/src/polymorphic/tests/test_pexp.py
+@@ -0,0 +1,643 @@
++from __future__ import annotations
++
++import uuid
++
++import pytest
++from django.contrib.contenttypes.models import ContentType
++from django.db.models import Q
++from django.test import TransactionTestCase
++
++from pexp.models import (
++    ArtProject,
++    NormalModelA,
++    NormalModelB,
++    NormalModelC,
++    Project,
++    ProxyA,
++    ProxyB,
++    ProxyBase,
++    ResearchProject,
++    TestModelA,
++    TestModelB,
++    TestModelC,
++    UUIDModelA,
++    UUIDModelB,
++    UUIDModelC,
++)
++
++
++class TestProjectPolymorphic(TransactionTestCase):
++
++    def setUp(self):
++        super().setUp()
++        self.project = Project.objects.create(topic="General Topic")
++        self.art_project = ArtProject.objects.create(
++            topic="Art Topic", artist="Vincent van Gogh"
++        )
++        self.research_project = ResearchProject.objects.create(
++            topic="Research Topic", supervisor="Dr. Smith"
++        )
++
++    def test_polymorphic_queryset_returns_correct_types(self):
++        qs = Project.objects.all().order_by("id")
++        objects = list(qs)
++        assert len(objects) == 3
++        assert isinstance(objects[0], Project)
++        assert not isinstance(objects[0], ArtProject)
++        assert not isinstance(objects[0], ResearchProject)
++        assert isinstance(objects[1], ArtProject)
++        assert isinstance(objects[2], ResearchProject)
++
++    def test_non_polymorphic_queryset_returns_base_type(self):
++        qs = Project.objects.all().non_polymorphic().order_by("id")
++        objects = list(qs)
++        assert len(objects) == 3
++        for obj in objects:
++            assert type(obj) is Project
++
++    def test_get_real_instance_base_model(self):
++        o = Project.objects.non_polymorphic().get(topic="General Topic")
++        real = o.get_real_instance()
++        assert type(real) is Project
++
++    def test_get_real_instance_child_model(self):
++        o = Project.objects.non_polymorphic().get(topic="Art Topic")
++        real = o.get_real_instance()
++        assert isinstance(real, ArtProject)
++        assert real.artist == "Vincent van Gogh"
++
++    def test_get_real_instance_grandchild_not_applicable(self):
++        o = Project.objects.non_polymorphic().get(topic="Research Topic")
++        real = o.get_real_instance()
++        assert isinstance(real, ResearchProject)
++        assert real.supervisor == "Dr. Smith"
++
++    def test_get_real_instances_from_queryset(self):
++        qs = Project.objects.all().non_polymorphic().order_by("id")
++        objects = Project.objects.get_real_instances(qs)
++        assert len(objects) == 3
++        assert type(objects[0]) is Project
++        assert isinstance(objects[1], ArtProject)
++        assert isinstance(objects[2], ResearchProject)
++
++    def test_get_real_instances_empty_list(self):
++        objects = Project.objects.get_real_instances([])
++        assert objects == []
++
++    def test_instance_of_single_model(self):
++        qs = Project.objects.filter(instance_of=ArtProject)
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], ArtProject)
++
++    def test_instance_of_multiple_models(self):
++        qs = Project.objects.filter(instance_of=(ArtProject, ResearchProject)).order_by("id")
++        objects = list(qs)
++        assert len(objects) == 2
++        assert isinstance(objects[0], ArtProject)
++        assert isinstance(objects[1], ResearchProject)
++
++    def test_instance_of_base_model(self):
++        qs = Project.objects.filter(instance_of=Project).order_by("id")
++        objects = list(qs)
++        assert len(objects) == 3
++
++    def test_instance_of_via_translate_polymorphic_q_object(self):
++        q = Project.translate_polymorphic_Q_object(Q(instance_of=ArtProject))
++        objects = list(Project.objects.filter(q))
++        assert len(objects) == 1
++        assert isinstance(objects[0], ArtProject)
++
++    def test_delete_child_keep_parents(self):
++        art_pk = self.art_project.pk
++        project_pk = self.art_project.project_ptr_id
++
++        self.art_project.delete(keep_parents=True)
++
++        assert ArtProject.objects.filter(pk=art_pk).count() == 0
++        assert Project.objects.filter(pk=project_pk).count() == 1
++        parent = Project.objects.get(pk=project_pk)
++        assert type(parent) is Project
++
++    def test_delete_child_without_keep_parents_cascades(self):
++        art_pk = self.art_project.pk
++        project_pk = self.art_project.project_ptr_id
++
++        self.art_project.delete()
++
++        assert ArtProject.objects.filter(pk=art_pk).count() == 0
++        assert Project.objects.filter(pk=project_pk).count() == 0
++
++    def test_roundtrip_create_art_project_retrieve_as_parent(self):
++        art = ArtProject.objects.create(topic="Roundtrip Art", artist="Picasso")
++        parent = Project.objects.non_polymorphic().get(pk=art.pk)
++        assert type(parent) is Project
++        assert parent.topic == "Roundtrip Art"
++        real = parent.get_real_instance()
++        assert isinstance(real, ArtProject)
++        assert real.artist == "Picasso"
++
++    def test_roundtrip_create_research_project_retrieve_as_parent(self):
++        research = ResearchProject.objects.create(
++            topic="Roundtrip Research", supervisor="Dr. Jones"
++        )
++        parent = Project.objects.non_polymorphic().get(pk=research.pk)
++        real = parent.get_real_instance()
++        assert isinstance(real, ResearchProject)
++        assert real.supervisor == "Dr. Jones"
++
++    def test_roundtrip_polymorphic_query_after_keep_parents_delete(self):
++        art = ArtProject.objects.create(topic="Pre-delete Art", artist="Dali")
++        art_pk = art.pk
++
++        art.delete(keep_parents=True)
++
++        qs = list(Project.objects.all().order_by("id"))
++        assert len(qs) == 4
++        parent_from_qs = [o for o in qs if o.pk == art_pk][0]
++        assert type(parent_from_qs) is Project
++        assert parent_from_qs.topic == "Pre-delete Art"
++
++    def test_get_real_instance_class(self):
++        o = ArtProject.objects.create(topic="Class test", artist="Monet")
++        parent = Project.objects.non_polymorphic().get(pk=o.pk)
++        real_class = parent.get_real_instance_class()
++        assert real_class is ArtProject
++
++    def test_get_real_concrete_instance_class(self):
++        o = ArtProject.objects.create(topic="Concrete class", artist="Rembrandt")
++        parent = Project.objects.non_polymorphic().get(pk=o.pk)
++        concrete_class = parent.get_real_concrete_instance_class()
++        assert concrete_class is ArtProject
++
++    def test_get_real_concrete_instance_class_id(self):
++        o = ArtProject.objects.create(topic="Class ID test", artist="Klimt")
++        parent = Project.objects.non_polymorphic().get(pk=o.pk)
++        class_id = parent.get_real_concrete_instance_class_id()
++        assert class_id == ContentType.objects.get_for_model(ArtProject).pk
++
++    def test_project_str(self):
++        p = Project.objects.create(topic="Str test")
++        assert str(p) is not None
++
++    def test_art_project_str(self):
++        a = ArtProject.objects.create(topic="Art str", artist="Goya")
++        assert str(a) is not None
++
++    def test_research_project_str(self):
++        r = ResearchProject.objects.create(topic="Research str", supervisor="Dr. Who")
++        assert str(r) is not None
++
++    def test_polymorphic_ctype_is_set(self):
++        p = Project.objects.create(topic="CT test")
++        assert p.polymorphic_ctype_id is not None
++        assert p.polymorphic_ctype == ContentType.objects.get_for_model(Project)
++
++    def test_child_polymorphic_ctype_correct(self):
++        a = ArtProject.objects.create(topic="Child CT", artist="Munch")
++        assert a.polymorphic_ctype == ContentType.objects.get_for_model(ArtProject)
++
++
++class TestUUIDModelPolymorphic(TransactionTestCase):
++
++    def setUp(self):
++        super().setUp()
++        self.a = UUIDModelA.objects.create(
++            uuid_primary_key=uuid.uuid4(), field1="A-field1"
++        )
++        self.b = UUIDModelB.objects.create(
++            uuid_primary_key=uuid.uuid4(), field1="B-field1", field2="B-field2"
++        )
++        self.c = UUIDModelC.objects.create(
++            uuid_primary_key=uuid.uuid4(),
++            field1="C-field1",
++            field2="C-field2",
++            field3="C-field3",
++        )
++
++    def test_polymorphic_queryset_returns_correct_types(self):
++        qs = UUIDModelA.objects.all().order_by("field1")
++        objects = list(qs)
++        assert len(objects) == 3
++        assert isinstance(objects[0], UUIDModelA)
++        assert not isinstance(objects[0], UUIDModelB)
++        assert isinstance(objects[1], UUIDModelB)
++        assert not isinstance(objects[1], UUIDModelC)
++        assert isinstance(objects[2], UUIDModelC)
++
++    def test_uuid_primary_key_is_correct_type(self):
++        assert isinstance(self.a.pk, uuid.UUID)
++        assert isinstance(self.b.pk, uuid.UUID)
++        assert isinstance(self.c.pk, uuid.UUID)
++
++    def test_get_real_instance_uuid_base(self):
++        o = UUIDModelA.objects.non_polymorphic().get(pk=self.a.pk)
++        real = o.get_real_instance()
++        assert type(real) is UUIDModelA
++        assert real.field1 == "A-field1"
++
++    def test_get_real_instance_uuid_child_b(self):
++        o = UUIDModelA.objects.non_polymorphic().get(pk=self.b.pk)
++        real = o.get_real_instance()
++        assert isinstance(real, UUIDModelB)
++        assert real.field2 == "B-field2"
++
++    def test_get_real_instance_uuid_child_c(self):
++        o = UUIDModelA.objects.non_polymorphic().get(pk=self.c.pk)
++        real = o.get_real_instance()
++        assert isinstance(real, UUIDModelC)
++        assert real.field3 == "C-field3"
++
++    def test_instance_of_uuid_b(self):
++        qs = UUIDModelA.objects.filter(instance_of=UUIDModelB)
++        objects = list(qs)
++        assert len(objects) == 2
++        for obj in objects:
++            assert isinstance(obj, UUIDModelB)
++
++    def test_instance_of_uuid_c(self):
++        qs = UUIDModelA.objects.filter(instance_of=UUIDModelC)
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], UUIDModelC)
++
++    def test_instance_of_uuid_multiple(self):
++        qs = UUIDModelA.objects.filter(
++            instance_of=(UUIDModelB, UUIDModelC)
++        ).order_by("field1")
++        objects = list(qs)
++        assert len(objects) == 3
++        assert isinstance(objects[0], UUIDModelB)
++        assert isinstance(objects[1], UUIDModelB)
++        assert isinstance(objects[2], UUIDModelC)
++
++    def test_delete_child_b_keep_parents(self):
++        b_pk = self.b.pk
++        b_uuid_ptr = self.b.uuidmodela_ptr_id
++
++        self.b.delete(keep_parents=True)
++
++        assert UUIDModelB.objects.filter(pk=b_pk).count() == 0
++        parent = UUIDModelA.objects.get(pk=b_uuid_ptr)
++        assert type(parent) is UUIDModelA
++        assert parent.field1 == "B-field1"
++
++    def test_delete_child_c_keep_parents(self):
++        c_pk = self.c.pk
++        c_uuid_ptr = self.c.uuidmodela_ptr_id
++
++        self.c.delete(keep_parents=True)
++
++        assert UUIDModelC.objects.filter(pk=c_pk).count() == 0
++        parent = UUIDModelA.objects.get(pk=c_uuid_ptr)
++        assert type(parent) is UUIDModelA
++        assert parent.field1 == "C-field1"
++
++    def test_delete_child_b_without_keep_parents_cascades(self):
++        b_pk = self.b.pk
++        b_uuid_ptr = self.b.uuidmodela_ptr_id
++
++        self.b.delete()
++
++        assert UUIDModelB.objects.filter(pk=b_pk).count() == 0
++        assert UUIDModelA.objects.filter(pk=b_uuid_ptr).count() == 0
++
++    def test_roundtrip_uuid_create_child_retrieve_as_base(self):
++        child = UUIDModelC.objects.create(
++            uuid_primary_key=uuid.uuid4(),
++            field1="RT-field1",
++            field2="RT-field2",
++            field3="RT-field3",
++        )
++        base = UUIDModelA.objects.non_polymorphic().get(pk=child.pk)
++        assert type(base) is UUIDModelA
++        real = base.get_real_instance()
++        assert isinstance(real, UUIDModelC)
++        assert real.field1 == "RT-field1"
++        assert real.field2 == "RT-field2"
++        assert real.field3 == "RT-field3"
++
++    def test_roundtrip_polymorphic_after_keep_parents(self):
++        child = UUIDModelB.objects.create(
++            uuid_primary_key=uuid.uuid4(), field1="KP-field1", field2="KP-field2"
++        )
++        child_pk = child.pk
++        child.delete(keep_parents=True)
++
++        qs = list(UUIDModelA.objects.all().order_by("field1"))
++        parent = [o for o in qs if o.pk == child_pk][0]
++        assert type(parent) is UUIDModelA
++        assert parent.field1 == "KP-field1"
++
++
++class TestProxyModelPolymorphic(TransactionTestCase):
++
++    def setUp(self):
++        super().setUp()
++        self.base_a = ProxyA.objects.create(title="Proxy A Title")
++        self.base_b = ProxyB.objects.create(title="Proxy B Title")
++        self.plain_base = ProxyBase.objects.create(title="Plain Base Title")
++
++    def test_proxy_model_same_table(self):
++        assert ProxyBase.objects.count() == 3
++        assert ProxyA.objects.count() == 1
++        assert ProxyB.objects.count() == 1
++
++    def test_proxy_base_queryset_returns_all(self):
++        qs = ProxyBase.objects.all().order_by("title")
++        objects = list(qs)
++        assert len(objects) == 3
++        titles = [o.title for o in objects]
++        assert titles == ["Plain Base Title", "Proxy A Title", "Proxy B Title"]
++
++    def test_proxy_a_queryset_only_returns_a(self):
++        qs = ProxyA.objects.all()
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], ProxyA)
++        assert objects[0].title == "Proxy A Title"
++
++    def test_proxy_b_queryset_only_returns_b(self):
++        qs = ProxyB.objects.all()
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], ProxyB)
++        assert objects[0].title == "Proxy B Title"
++
++    def test_get_real_instance_proxy_a(self):
++        o = ProxyBase.objects.non_polymorphic().get(title="Proxy A Title")
++        real = o.get_real_instance()
++        assert isinstance(real, ProxyA)
++
++    def test_get_real_instance_proxy_b(self):
++        o = ProxyBase.objects.non_polymorphic().get(title="Proxy B Title")
++        real = o.get_real_instance()
++        assert isinstance(real, ProxyB)
++
++    def test_get_real_instance_proxy_base(self):
++        o = ProxyBase.objects.non_polymorphic().get(title="Plain Base Title")
++        real = o.get_real_instance()
++        assert type(real) is ProxyBase
++
++    def test_instance_of_proxy_a(self):
++        qs = ProxyBase.objects.filter(instance_of=ProxyA)
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], ProxyA)
++
++    def test_instance_of_proxy_b(self):
++        qs = ProxyBase.objects.filter(instance_of=ProxyB)
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], ProxyB)
++
++    def test_instance_of_proxy_base(self):
++        qs = ProxyBase.objects.filter(instance_of=ProxyBase)
++        objects = list(qs)
++        assert len(objects) == 3
++
++    def test_instance_of_multiple_proxy(self):
++        qs = ProxyBase.objects.filter(instance_of=(ProxyA, ProxyB)).order_by("title")
++        objects = list(qs)
++        assert len(objects) == 2
++        assert isinstance(objects[0], ProxyA)
++        assert isinstance(objects[1], ProxyB)
++
++    def test_delete_proxy_keep_parents(self):
++        self.base_a.delete(keep_parents=True)
++
++        assert ProxyA.objects.count() == 0
++        assert ProxyBase.objects.count() == 2
++
++    def test_delete_proxy_without_keep_parents(self):
++        self.base_a.delete()
++
++        assert ProxyA.objects.count() == 0
++        assert ProxyBase.objects.count() == 2
++
++    def test_roundtrip_proxy_create_retrieve(self):
++        pa = ProxyA.objects.create(title="Roundtrip Proxy A")
++        base = ProxyBase.objects.non_polymorphic().get(pk=pa.pk)
++        real = base.get_real_instance()
++        assert isinstance(real, ProxyA)
++        assert real.title == "Roundtrip Proxy A"
++
++    def test_roundtrip_proxy_after_keep_parents_delete(self):
++        pa = ProxyA.objects.create(title="Post-delete test")
++        pa_pk = pa.pk
++        pa.delete(keep_parents=True)
++
++        base = ProxyBase.objects.get(pk=pa_pk)
++        assert type(base) is ProxyBase
++        assert base.title == "Post-delete test"
++
++    def test_proxy_unicode(self):
++        pa = ProxyA.objects.create(title="Unicode test")
++        assert str(pa) is not None
++        pb = ProxyB.objects.create(title="Unicode B")
++        assert str(pb) is not None
++
++    def test_proxy_model_polymorphic_ctype(self):
++        pa = ProxyA.objects.create(title="CT proxy")
++        assert pa.polymorphic_ctype is not None
++
++    def test_non_polymorphic_proxy_queryset(self):
++        qs = ProxyBase.objects.all().non_polymorphic().order_by("title")
++        objects = list(qs)
++        assert len(objects) == 3
++        for obj in objects:
++            assert type(obj) is ProxyBase
++
++
++class TestTestModelPolymorphic(TransactionTestCase):
++
++    def setUp(self):
++        super().setUp()
++        self.a = TestModelA.objects.create(field1="A1")
++        self.b = TestModelB.objects.create(field1="B1", field2="B2")
++        self.c = TestModelC.objects.create(
++            field1="C1", field2="C2", field3="C3"
++        )
++        self.b2 = TestModelB.objects.create(field1="B-extra", field2="B-extra2")
++        self.c.field4.add(self.b, self.b2)
++
++    def test_polymorphic_queryset_returns_correct_types(self):
++        qs = TestModelA.objects.all().order_by("field1")
++        objects = list(qs)
++        assert len(objects) == 4
++        assert isinstance(objects[0], TestModelA)
++        assert isinstance(objects[1], TestModelB)
++        assert isinstance(objects[2], TestModelB)
++        assert isinstance(objects[3], TestModelC)
++
++    def test_m2m_field_on_test_model_c(self):
++        c = TestModelC.objects.get(field1="C1")
++        assert c.field4.count() == 2
++        related = list(c.field4.all())
++        assert self.b in related
++        assert self.b2 in related
++
++    def test_m2m_reverse_relation(self):
++        related_c = list(self.b.related_c.all())
++        assert len(related_c) == 1
++        assert isinstance(related_c[0], TestModelC)
++
++    def test_get_real_instance_test_model_b(self):
++        o = TestModelA.objects.non_polymorphic().get(field1="B1")
++        real = o.get_real_instance()
++        assert isinstance(real, TestModelB)
++        assert real.field2 == "B2"
++
++    def test_get_real_instance_test_model_c(self):
++        o = TestModelA.objects.non_polymorphic().get(field1="C1")
++        real = o.get_real_instance()
++        assert isinstance(real, TestModelC)
++        assert real.field3 == "C3"
++
++    def test_instance_of_test_model_b(self):
++        qs = TestModelA.objects.filter(instance_of=TestModelB).order_by("field1")
++        objects = list(qs)
++        assert len(objects) == 2
++        assert isinstance(objects[0], TestModelB)
++        assert isinstance(objects[1], TestModelB)
++
++    def test_instance_of_test_model_c(self):
++        qs = TestModelA.objects.filter(instance_of=TestModelC)
++        objects = list(qs)
++        assert len(objects) == 1
++        assert isinstance(objects[0], TestModelC)
++
++    def test_delete_child_b_keep_parents(self):
++        b_pk = self.b.pk
++        ptr_id = self.b.testmodela_ptr_id
++
++        self.b.delete(keep_parents=True)
++
++        assert TestModelB.objects.filter(pk=b_pk).count() == 0
++        parent = TestModelA.objects.get(pk=ptr_id)
++        assert type(parent) is TestModelA
++        assert parent.field1 == "B1"
++
++    def test_delete_child_c_keep_parents(self):
++        c_pk = self.c.pk
++        ptr_id = self.c.testmodela_ptr_id
++
++        self.c.delete(keep_parents=True)
++
++        assert TestModelC.objects.filter(pk=c_pk).count() == 0
++        parent = TestModelA.objects.get(pk=ptr_id)
++        assert type(parent) is TestModelA
++
++    def test_delete_child_without_keep_parents_cascades(self):
++        b_pk = self.b2.pk
++        ptr_id = self.b2.testmodela_ptr_id
++
++        self.b2.delete()
++
++        assert TestModelB.objects.filter(pk=b_pk).count() == 0
++        assert TestModelA.objects.filter(pk=ptr_id).count() == 0
++
++    def test_roundtrip_create_test_model_c_with_m2m(self):
++        new_c = TestModelC.objects.create(
++            field1="RTC1", field2="RTC2", field3="RTC3"
++        )
++        parent = TestModelA.objects.non_polymorphic().get(pk=new_c.pk)
++        real = parent.get_real_instance()
++        assert isinstance(real, TestModelC)
++        assert real.field1 == "RTC1"
++        assert real.field2 == "RTC2"
++        assert real.field3 == "RTC3"
++
++    def test_roundtrip_after_keep_parents_delete(self):
++        child = TestModelB.objects.create(field1="KP1", field2="KP2")
++        child_pk = child.pk
++        child.delete(keep_parents=True)
++
++        qs = list(TestModelA.objects.all().order_by("field1"))
++        parent = [o for o in qs if o.pk == child_pk][0]
++        assert type(parent) is TestModelA
++        assert parent.field1 == "KP1"
++
++    def test_test_model_a_str(self):
++        a = TestModelA.objects.create(field1="strtest")
++        assert str(a) is not None
++
++    def test_test_model_b_str(self):
++        b = TestModelB.objects.create(field1="strB", field2="strB2")
++        assert str(b) is not None
++
++    def test_test_model_c_str(self):
++        c = TestModelC.objects.create(field1="strC", field2="strC2", field3="strC3")
++        assert str(c) is not None
++
++
++class TestNormalModelInheritance(TransactionTestCase):
++
++    def setUp(self):
++        super().setUp()
++        self.a = NormalModelA.objects.create(field1="NA1")
++        self.b = NormalModelB.objects.create(field1="NB1", field2="NB2")
++        self.c = NormalModelC.objects.create(
++            field1="NC1", field2="NC2", field3="NC3"
++        )
++
++    def test_normal_inheritance_multi_table(self):
++        assert NormalModelA.objects.count() == 3
++        assert NormalModelB.objects.count() == 2
++        assert NormalModelC.objects.count() == 1
++
++    def test_normal_base_queryset_only_returns_base_fields(self):
++        objs = list(NormalModelA.objects.all().order_by("field1"))
++        assert len(objs) == 3
++        assert objs[0].field1 == "NA1"
++
++    def test_normal_child_b_access_parent_field(self):
++        b = NormalModelB.objects.get(field2="NB2")
++        assert b.field1 == "NB1"
++
++    def test_normal_child_c_access_all_fields(self):
++        c = NormalModelC.objects.get(field3="NC3")
++        assert c.field1 == "NC1"
++        assert c.field2 == "NC2"
++
++    def test_normal_model_not_polymorphic(self):
++        from polymorphic.models import PolymorphicModel
++
++        assert isinstance(self.a, NormalModelA)
++        assert not isinstance(self.a, PolymorphicModel)
++
++    def test_normal_model_delete_cascades(self):
++        b_ptr_id = self.b.normalmodela_ptr_id
++        self.b.delete()
++        assert NormalModelB.objects.count() == 1
++        assert NormalModelA.objects.filter(pk=b_ptr_id).count() == 0
++
++    def test_normal_model_roundtrip(self):
++        c = NormalModelC.objects.create(field1="RTN1", field2="RTN2", field3="RTN3")
++        parent = NormalModelA.objects.get(pk=c.pk)
++        assert parent.field1 == "RTN1"
++        assert isinstance(parent, NormalModelA)
++        assert not isinstance(parent, NormalModelC)
++
++    def test_normal_model_str(self):
++        assert str(self.a) is not None
++        assert str(self.b) is not None
++        assert str(self.c) is not None
++
++
++class TestCrossModelEdgeCases(TransactionTestCase):
++
++    def test_get_real_instance_stale_content_type_for_project(self):
++        ctype = ContentType.objects.create(
++            app_label="pexp", model="nonexistent_model"
++        )
++        p = Project.objects.create(topic="Stale CT test", polymorphic_ctype=ctype)
++
++        from polymorphic.models import PolymorphicTypeInvalid
++
++        with pytest.raises(PolymorphicTypeInvalid, match="does not have a corresponding model"):
++            p.get_real_instance()
++
++        assert p.get_real_instance_class() is None
++        assert p.get_real_concrete_instance_class() is None
++        assert p.get_real_concrete_instance_class_id() is None
+\ No newline at end of file

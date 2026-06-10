@@ -128,7 +128,7 @@ select = [
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "polymorphic.tests.settings"
-pythonpath = ["src"]
+pythonpath = ["src", "example"]
 django_find_project = false
 testpaths = ["src/polymorphic/tests"]
 python_files = "test*.py"
@@ -146,7 +146,8 @@ addopts = [
 
 [tool.coverage.run]
 source = [
-    "src"
+    "src",
+    "example"
 ]
 omit = ["*/migrations/*", "*/tests/*", "src/polymorphic/tests/*"]
 branch = true
