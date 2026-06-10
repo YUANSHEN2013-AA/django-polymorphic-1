@@ -128,9 +128,9 @@ select = [
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "polymorphic.tests.settings"
-pythonpath = ["src"]
+pythonpath = ["src", "example"]
 django_find_project = false
-testpaths = ["src/polymorphic/tests"]
+testpaths = ["src/polymorphic/tests", "example/pexp/tests"]
 python_files = "test*.py"
 python_classes = "Test*"
 python_functions = "test_*"
@@ -141,12 +141,15 @@ markers = [
 ]
 addopts = [
     "--strict-markers",
-   "-m", "not integration",
+    "-m", "not integration",
+    "--cov-report=term-missing",
+    "--cov-report=xml:coverage.xml",
 ]
 
 [tool.coverage.run]
 source = [
-    "src"
+    "src",
+    "example/pexp",
 ]
 omit = ["*/migrations/*", "*/tests/*", "src/polymorphic/tests/*"]
 branch = true
@@ -257,67 +260,4 @@ docs = [
     "sphinx>=7.1.2",
     "sphinx-autobuild>=2024.10.3",
     "sphinxcontrib-django>=2.5",
-]
-psycopg2 = [
-    "psycopg2>=2.9.10",
-]
-psycopg3 = [
-    "psycopg>=3.3.2",
-]
-mysql = [
-    "mysqlclient>=1.4.0",
-]
-mysqlclient14 = [
-    "mysqlclient==1.4.3",
-]
-mysqlclient2x = [
-    "mysqlclient>=2.2.8",
-]
-cx_oracle = [
-    "cx-oracle>=8.3.0"
-]
-
-oracledb = [
-    "oracledb>=2.3.0",
-]
-reversion = [
-    "django-reversion>=6.1.0",
-]
-extra-views = [
-    "django-extra-views>=0.16.0",
-]
-drf = [
-    "django-filter>=24.0",
-    "djangorestframework>=3.16.1",
-]
-guardian = [
-    "django-guardian<3.3.0",
-]
-integrations = [
-    { include-group = "extra-views" },
-    { include-group = "drf" },
-]
-precommit = [
-    "pre-commit>=3.5.0",
-]
-dj42 = [
-    "Django~=4.2; python_version < '3.13'",
-]
-dj52 = [
-    "Django~=5.2",
-]
-dj60 = [
-    "Django~=6.0; python_version >= '3.12'",
-]
-dev = [
-    { include-group = "typing" },
-    { include-group = "test" },
-    { include-group = "docs" },
-    { include-group = "drf" },
-    { include-group = "lint" },
-    { include-group = "precommit" },
-    "packaging>=24.2",
-    "tomlkit>=0.13.3",
-    "ipdb>=0.13.13",
-    "ipython>=8.18.1",
 ]
