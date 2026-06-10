@@ -1,0 +1,464 @@
+import pytest
+import uuid
+from django.contrib.contenttypes.models import ContentType
+from django.db import models
+from django.test import TransactionTestCase
+import django
+
+from pexp.models import (
+    Project,
+    ArtProject,
+    ResearchProject,
+    UUIDModelA,
+    UUIDModelB,
+    UUIDModelC,
+    ProxyBase,
+    ProxyA,
+    ProxyB,
+    TestModelA,
+    TestModelB,
+    TestModelC,
+    NormalModelA,
+    NormalModelB,
+    NormalModelC,
+)
+
+
+@pytest.mark.django_db
+class TestPexpPolymorphicModels(TransactionTestCase):
+    def test_get_real_instance_basic(self):
+        art = ArtProject.objects.create(topic="Art Exhibition", artist="John Doe")
+        research = ResearchProject.objects.create(topic="AI Research", supervisor="Dr. Smith")
+
+        art_base = Project.objects.non_polymorphic().get(pk=art.pk)
+        assert art_base.__class__ is Project
+        real_art = art_base.get_real_instance()
+        assert real_art.__class__ is ArtProject
+        assert real_art.topic == "Art Exhibition"
+        assert real_art.artist == "John Doe"
+
+        research_base = Project.objects.non_polymorphic().get(pk=research.pk)
+        real_research = research_base.get_real_instance()
+        assert real_research.__class__ is ResearchProject
+        assert real_research.topic == "AI Research"
+        assert real_research.supervisor == "Dr. Smith"
+
+    def test_get_real_instance_class(self):
+        art = ArtProject.objects.create(topic="Art", artist="Artist")
+        base = Project.objects.non_polymorphic().get(pk=art.pk)
+        assert base.get_real_instance_class() == ArtProject
+
+    def test_get_real_instance_with_uuid_primary_key(self):
+        obj_a = UUIDModelA.objects.create(uuid_primary_key=uuid.uuid4(), field1="A")
+        obj_b = UUIDModelB.objects.create(uuid_primary_key=uuid.uuid4(), field1="A", field2="B")
+        obj_c = UUIDModelC.objects.create(uuid_primary_key=uuid.uuid4(), field1="A", field2="B", field3="C")
+
+        base_a = UUIDModelA.objects.non_polymorphic().get(pk=obj_a.pk)
+        base_b = UUIDModelA.objects.non_polymorphic().get(pk=obj_b.pk)
+        base_c = UUIDModelA.objects.non_polymorphic().get(pk=obj_c.pk)
+
+        assert base_a.get_real_instance().__class__ is UUIDModelA
+        assert base_b.get_real_instance().__class__ is UUIDModelB
+        assert base_c.get_real_instance().__class__ is UUIDModelC
+
+        assert base_a.get_real_instance().uuid_primary_key == obj_a.uuid_primary_key
+        assert base_b.get_real_instance().field2 == "B"
+        assert base_c.get_real_instance().field3 == "C"
+
+    def test_get_real_instance_proxy_models(self):
+        base = ProxyBase.objects.create(title="Base")
+        proxy_a = ProxyA.objects.create(title="Proxy A")
+        proxy_b = ProxyB.objects.create(title="Proxy B")
+
+        base_obj = ProxyBase.objects.non_polymorphic().get(pk=proxy_a.pk)
+        assert base_obj.get_real_instance_class() == ProxyA
+        assert isinstance(base_obj.get_real_instance(), ProxyA)
+
+        base_obj_b = ProxyBase.objects.non_polymorphic().get(pk=proxy_b.pk)
+        assert base_obj_b.get_real_instance_class() == ProxyB
+        assert isinstance(base_obj_b.get_real_instance(), ProxyB)
+
+        base_direct = ProxyBase.objects.non_polymorphic().get(pk=base.pk)
+        assert base_direct.get_real_instance_class() == ProxyBase
+        assert isinstance(base_direct.get_real_instance(), ProxyBase)
+
+    def test_get_real_instance_multi_level_inheritance(self):
+        obj_c = TestModelC.objects.create(field1="F1", field2="F2", field3="F3")
+        obj_b = TestModelB.objects.create(field1="F1", field2="F2")
+
+        base_a_c = TestModelA.objects.non_polymorphic().get(pk=obj_c.pk)
+        assert base_a_c.get_real_instance().__class__ is TestModelC
+        assert base_a_c.get_real_instance().field3 == "F3"
+
+        base_a_b = TestModelA.objects.non_polymorphic().get(pk=obj_b.pk)
+        assert base_a_b.get_real_instance().__class__ is TestModelB
+        assert base_a_b.get_real_instance().field2 == "F2"
+
+    def test_get_real_instance_with_stale_content_type_raises_error(self):
+        ctype = ContentType.objects.create(app_label="pexp", model="deletedmodel")
+        obj = Project.objects.create(topic="Test", polymorphic_ctype=ctype)
+
+        assert obj.get_real_instance_class() is None
+        from polymorphic.models import PolymorphicTypeInvalid
+        with pytest.raises(PolymorphicTypeInvalid, match="does not have a corresponding model"):
+            obj.get_real_instance()
+
+    def test_instance_of_filter_single_model(self):
+        ArtProject.objects.create(topic="Art 1", artist="Artist 1")
+        ArtProject.objects.create(topic="Art 2", artist="Artist 2")
+        ResearchProject.objects.create(topic="Research 1", supervisor="Supervisor 1")
+        Project.objects.create(topic="Base Project")
+
+        result = list(Project.objects.filter(instance_of=ArtProject))
+        assert len(result) == 2
+        assert all(isinstance(obj, ArtProject) for obj in result)
+
+        result = list(Project.objects.filter(instance_of=ResearchProject))
+        assert len(result) == 1
+        assert isinstance(result[0], ResearchProject)
+
+        result = list(Project.objects.instance_of(ArtProject))
+        assert len(result) == 2
+
+    def test_instance_of_filter_multiple_models(self):
+        ArtProject.objects.create(topic="Art 1", artist="A1")
+        ResearchProject.objects.create(topic="Research 1", supervisor="S1")
+        Project.objects.create(topic="Base 1")
+
+        result = list(Project.objects.filter(instance_of=(ArtProject, ResearchProject)))
+        assert len(result) == 2
+
+        result = list(Project.objects.instance_of(ArtProject, ResearchProject))
+        assert len(result) == 2
+
+    def test_instance_of_with_not_instance_of(self):
+        ArtProject.objects.create(topic="Art 1", artist="A1")
+        ResearchProject.objects.create(topic="Research 1", supervisor="S1")
+        Project.objects.create(topic="Base 1")
+
+        result = list(Project.objects.not_instance_of(ArtProject))
+        assert len(result) == 2
+        assert any(isinstance(obj, ResearchProject) for obj in result)
+        assert any(isinstance(obj, Project) and not isinstance(obj, (ArtProject, ResearchProject)) for obj in result)
+
+        result = list(Project.objects.not_instance_of(ArtProject, ResearchProject))
+        assert len(result) == 1
+        assert all(isinstance(obj, Project) and not isinstance(obj, (ArtProject, ResearchProject)) for obj in result)
+
+    def test_instance_of_with_q_object(self):
+        from django.db.models import Q
+        ArtProject.objects.create(topic="Art 1", artist="A1")
+        ResearchProject.objects.create(topic="Research 1", supervisor="S1")
+        ArtProject.objects.create(topic="Another Art", artist="A2")
+
+        q = Q(instance_of=ArtProject) & Q(topic__icontains="Art")
+        result = list(Project.objects.filter(q))
+        assert len(result) == 2
+
+        q = Q(instance_of=ArtProject) | Q(instance_of=ResearchProject)
+        result = list(Project.objects.filter(q))
+        assert len(result) == 3
+
+    def test_instance_of_proxy_models(self):
+        ProxyBase.objects.create(title="Base")
+        ProxyA.objects.create(title="Proxy A 1")
+        ProxyA.objects.create(title="Proxy A 2")
+        ProxyB.objects.create(title="Proxy B 1")
+
+        result = list(ProxyBase.objects.filter(instance_of=ProxyA))
+        assert len(result) == 2
+        assert all(isinstance(obj, ProxyA) for obj in result)
+
+        result = list(ProxyBase.objects.filter(instance_of=ProxyB))
+        assert len(result) == 1
+        assert isinstance(result[0], ProxyB)
+
+        result = list(ProxyBase.objects.instance_of(ProxyA, ProxyB))
+        assert len(result) == 3
+
+    def test_instance_of_multi_level_inheritance(self):
+        TestModelA.objects.create(field1="A")
+        TestModelB.objects.create(field1="A", field2="B")
+        TestModelC.objects.create(field1="A", field2="B", field3="C")
+
+        assert TestModelA.objects.filter(instance_of=TestModelA).count() == 3
+        assert TestModelA.objects.filter(instance_of=TestModelB).count() == 2
+        assert TestModelA.objects.filter(instance_of=TestModelC).count() == 1
+
+        assert TestModelA.objects.instance_of(TestModelA).count() == 3
+        assert TestModelA.objects.instance_of(TestModelB).count() == 2
+        assert TestModelA.objects.instance_of(TestModelC).count() == 1
+
+    def test_delete_keep_parents_single_level(self):
+        art = ArtProject.objects.create(topic="Art", artist="Artist")
+        art_pk = art.pk
+
+        assert ArtProject.objects.filter(pk=art_pk).exists()
+        assert Project.objects.filter(pk=art_pk).exists()
+
+        art.delete(keep_parents=True)
+
+        assert not ArtProject.objects.filter(pk=art_pk).exists()
+        assert Project.objects.filter(pk=art_pk).exists()
+
+        parent = Project.objects.get(pk=art_pk)
+        assert parent.__class__ is Project
+        assert parent.topic == "Art"
+
+    def test_delete_keep_parents_multi_level(self):
+        obj_c = TestModelC.objects.create(field1="F1", field2="F2", field3="F3")
+        obj_c_pk = obj_c.pk
+
+        assert TestModelC.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelB.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelA.objects.filter(pk=obj_c_pk).exists()
+
+        obj_c.delete(keep_parents=True)
+
+        assert not TestModelC.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelB.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelA.objects.filter(pk=obj_c_pk).exists()
+
+        obj_b = TestModelB.objects.get(pk=obj_c_pk)
+        assert obj_b.__class__ is TestModelB
+        assert obj_b.field1 == "F1"
+        assert obj_b.field2 == "F2"
+
+        obj_b.delete(keep_parents=True)
+
+        assert not TestModelB.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelA.objects.filter(pk=obj_c_pk).exists()
+
+        obj_a = TestModelA.objects.get(pk=obj_c_pk)
+        assert obj_a.__class__ is TestModelA
+        assert obj_a.field1 == "F1"
+
+    def test_delete_keep_parents_uuid_models(self):
+        obj_c = UUIDModelC.objects.create(field1="F1", field2="F2", field3="F3")
+        obj_c_pk = obj_c.pk
+
+        obj_c.delete(keep_parents=True)
+
+        assert not UUIDModelC.objects.filter(pk=obj_c_pk).exists()
+        assert UUIDModelB.objects.filter(pk=obj_c_pk).exists()
+        assert UUIDModelA.objects.filter(pk=obj_c_pk).exists()
+
+        obj_b = UUIDModelB.objects.get(pk=obj_c_pk)
+        assert obj_b.__class__ is UUIDModelB
+        assert obj_b.field1 == "F1"
+        assert obj_b.field2 == "F2"
+
+    def test_delete_keep_parents_from_parent_queryset(self):
+        obj_b = TestModelB.objects.create(field1="F1", field2="F2")
+        obj_b_pk = obj_b.pk
+
+        assert TestModelB.objects.filter(pk=obj_b_pk).exists()
+        assert TestModelA.objects.filter(pk=obj_b_pk).exists()
+
+        base = TestModelA.objects.non_polymorphic().get(pk=obj_b_pk)
+        base.delete(keep_parents=True)
+
+        assert not TestModelB.objects.filter(pk=obj_b_pk).exists()
+        assert TestModelA.objects.filter(pk=obj_b_pk).exists()
+
+    def test_delete_keep_parents_proxy_model(self):
+        proxy_a = ProxyA.objects.create(title="Proxy A")
+        proxy_a_pk = proxy_a.pk
+
+        proxy_a.delete(keep_parents=True)
+
+        assert not ProxyA.objects.filter(pk=proxy_a_pk).exists()
+        assert ProxyBase.objects.filter(pk=proxy_a_pk).exists()
+        assert ProxyBase.objects.get(pk=proxy_a_pk).title == "Proxy A"
+
+    def test_delete_without_keep_parents_deletes_all(self):
+        art = ArtProject.objects.create(topic="Art", artist="Artist")
+        art_pk = art.pk
+
+        art.delete()
+
+        assert not ArtProject.objects.filter(pk=art_pk).exists()
+        assert not Project.objects.filter(pk=art_pk).exists()
+
+    def test_delete_keep_parents_with_many_to_many(self):
+        obj_c = TestModelC.objects.create(field1="F1", field2="F2", field3="F3")
+        obj_b1 = TestModelB.objects.create(field1="B1", field2="B2")
+        obj_b2 = TestModelB.objects.create(field1="B2", field2="B2")
+        obj_c.related_c.add(obj_b1, obj_b2)
+
+        obj_c_pk = obj_c.pk
+        initial_count = obj_c.related_c.count()
+        assert initial_count == 2
+
+        obj_c.delete(keep_parents=True)
+
+        assert not TestModelC.objects.filter(pk=obj_c_pk).exists()
+        assert TestModelB.objects.filter(pk=obj_b1.pk).exists()
+        assert TestModelB.objects.filter(pk=obj_b2.pk).exists()
+
+    def test_multi_table_roundtrip_create_retrieve_update_delete(self):
+        art = ArtProject.objects.create(topic="Roundtrip Art", artist="Roundtrip Artist")
+
+        art_fetched = ArtProject.objects.get(pk=art.pk)
+        assert art_fetched.topic == "Roundtrip Art"
+        assert art_fetched.artist == "Roundtrip Artist"
+
+        art_fetched.artist = "Updated Artist"
+        art_fetched.save()
+
+        art_updated = ArtProject.objects.get(pk=art.pk)
+        assert art_updated.artist == "Updated Artist"
+
+        base = Project.objects.non_polymorphic().get(pk=art.pk)
+        real_instance = base.get_real_instance()
+        assert real_instance.artist == "Updated Artist"
+
+        real_instance.delete(keep_parents=True)
+        assert not ArtProject.objects.filter(pk=art.pk).exists()
+        assert Project.objects.filter(pk=art.pk).exists()
+
+    def test_multi_table_roundtrip_uuid_inheritance(self):
+        uuid_obj = UUIDModelC.objects.create(
+            uuid_primary_key=uuid.UUID('12345678-1234-5678-1234-567812345678'),
+            field1="A",
+            field2="B",
+            field3="C"
+        )
+
+        fetched = UUIDModelC.objects.get(pk=uuid_obj.pk)
+        assert fetched.uuid_primary_key == uuid_obj.uuid_primary_key
+        assert fetched.field1 == "A"
+        assert fetched.field2 == "B"
+        assert fetched.field3 == "C"
+
+        fetched.field3 = "Updated C"
+        fetched.save()
+
+        updated = UUIDModelC.objects.get(pk=uuid_obj.pk)
+        assert updated.field3 == "Updated C"
+
+        updated.delete(keep_parents=True)
+        assert not UUIDModelC.objects.filter(pk=uuid_obj.pk).exists()
+        assert UUIDModelB.objects.filter(pk=uuid_obj.pk).exists()
+        assert UUIDModelA.objects.filter(pk=uuid_obj.pk).exists()
+
+        b = UUIDModelB.objects.get(pk=uuid_obj.pk)
+        assert b.field2 == "B"
+
+    def test_multi_table_roundtrip_multiple_level_changes(self):
+        obj_d = TestModelC.objects.create(field1="Level 1", field2="Level 2", field3="Level 3")
+        pk = obj_d.pk
+
+        assert TestModelC.objects.count() == 1
+        assert TestModelB.objects.count() == 1
+        assert TestModelA.objects.count() == 1
+
+        obj_d.delete(keep_parents=True)
+        assert TestModelC.objects.count() == 0
+        assert TestModelB.objects.count() == 1
+        assert TestModelA.objects.count() == 1
+
+        obj_b = TestModelB.objects.get(pk=pk)
+        obj_b.delete(keep_parents=True)
+        assert TestModelC.objects.count() == 0
+        assert TestModelB.objects.count() == 0
+        assert TestModelA.objects.count() == 1
+
+        obj_a = TestModelA.objects.get(pk=pk)
+        assert obj_a.field1 == "Level 1"
+        obj_a.delete()
+        assert TestModelA.objects.count() == 0
+
+    def test_get_real_instances_from_queryset(self):
+        ArtProject.objects.create(topic="A1", artist="Artist1")
+        ResearchProject.objects.create(topic="R1", supervisor="Supervisor1")
+        Project.objects.create(topic="P1")
+
+        qs = Project.objects.all().non_polymorphic()
+        real_instances = qs.get_real_instances()
+
+        assert len(real_instances) == 3
+        classes = [obj.__class__ for obj in real_instances]
+        assert ArtProject in classes
+        assert ResearchProject in classes
+        assert Project in classes
+
+    def test_get_real_instances_from_manager_with_list(self):
+        ArtProject.objects.create(topic="A1", artist="Artist1")
+        ResearchProject.objects.create(topic="R1", supervisor="Supervisor1")
+
+        qs = Project.objects.all().non_polymorphic()
+        real_instances = Project.objects.get_real_instances(list(qs))
+
+        assert len(real_instances) == 2
+        assert any(obj.__class__ is ArtProject for obj in real_instances)
+        assert any(obj.__class__ is ResearchProject for obj in real_instances)
+
+    def test_get_real_instances_empty_list(self):
+        result = Project.objects.get_real_instances([])
+        assert result == []
+
+    def test_normal_inheritance_behavior(self):
+        normal_c = NormalModelC.objects.create(field1="F1", field2="F2", field3="F3")
+        fetched = NormalModelC.objects.get(pk=normal_c.pk)
+        assert fetched.field1 == "F1"
+        assert fetched.field2 == "F2"
+        assert fetched.field3 == "F3"
+
+        fetched.delete()
+        assert not NormalModelC.objects.filter(pk=normal_c.pk).exists()
+
+    def test_instance_of_raises_type_error_for_invalid_args(self):
+        from polymorphic.query_translate import create_instanceof_q
+        with pytest.raises(TypeError, match="instance_of expects"):
+            create_instanceof_q("not a model", using="default")
+
+    def test_all_models_str_repr(self):
+        project = Project.objects.create(topic="Test Project")
+        art = ArtProject.objects.create(topic="Test Art", artist="Test")
+        assert "Test" in str(project)
+        assert "Test Art" in str(art)
+
+        proxy = ProxyA.objects.create(title="Test Proxy")
+        assert "Test Proxy" in str(proxy)
+
+        test_a = TestModelA.objects.create(field1="Test")
+        assert "Test" in repr(test_a)
+
+    def test_queryset_none_polymorphic(self):
+        ArtProject.objects.create(topic="A1", artist="Artist1")
+        qs = Project.objects.none().non_polymorphic()
+        assert qs.count() == 0
+
+    def test_multiple_instance_of_combinations(self):
+        ArtProject.objects.create(topic="A1", artist="A1")
+        ResearchProject.objects.create(topic="R1", supervisor="S1")
+        Project.objects.create(topic="P1")
+
+        result = Project.objects.filter(instance_of=ArtProject).instance_of(Project)
+        assert result.count() == 3
+
+    def test_ordering_with_proxy_models(self):
+        ProxyB.objects.create(title="B")
+        ProxyA.objects.create(title="A")
+        ProxyBase.objects.create(title="C")
+
+        objects = list(ProxyBase.objects.all())
+        assert [obj.title for obj in objects] == ["A", "B", "C"]
+
+    def test_content_type_updated_after_delete_keep_parents(self):
+        obj_c = TestModelC.objects.create(field1="A", field2="B", field3="C")
+        pk = obj_c.pk
+
+        obj_c.delete(keep_parents=True)
+
+        base = TestModelA.objects.get(pk=pk)
+        assert base.get_real_instance_class() == TestModelB
+        assert isinstance(base.get_real_instance(), TestModelB)
+
+        obj_b = TestModelB.objects.get(pk=pk)
+        obj_b.delete(keep_parents=True)
+
+        base = TestModelA.objects.get(pk=pk)
+        assert base.get_real_instance_class() == TestModelA
+        assert isinstance(base.get_real_instance(), TestModelA)
